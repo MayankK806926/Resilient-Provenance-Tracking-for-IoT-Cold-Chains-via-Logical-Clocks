@@ -23,28 +23,55 @@ This repository implements:
 
 ```
 .
-â”œâ”€â”€ CMakeLists.txt              # CMake build configuration (C++20)
-â”œâ”€â”€ Dockerfile                  # Multi-stage Docker container build
-â”œâ”€â”€ docker-compose.yml          # Containerized simulation runner
-â”œâ”€â”€ include/
-â”‚   â””â”€â”€ coldchain/              # Header definitions
-â”‚       â”œâ”€â”€ causal_merge_engine.hpp
-â”‚       â”œâ”€â”€ config.hpp
-â”‚       â”œâ”€â”€ events.hpp
-â”‚       â”œâ”€â”€ hashing.hpp
-â”‚       â”œâ”€â”€ iot_device.hpp
-â”‚       â”œâ”€â”€ ledger_block.hpp
-â”‚       â”œâ”€â”€ ledger_node.hpp
-â”‚       â”œâ”€â”€ matrix_clock.hpp
-â”‚       â”œâ”€â”€ metrics.hpp
-â”‚       â”œâ”€â”€ network_simulator.hpp
-â”‚       â”œâ”€â”€ physical_clock.hpp
-â”‚       â”œâ”€â”€ pruning_engine.hpp
-â”‚       â””â”€â”€ vector_clock.hpp
-â”œâ”€â”€ src/                        # Core implementation source files
-â”œâ”€â”€ tests/                      # Unit and integration tests (doctest)
-â”œâ”€â”€ experiments/                # Parameter sweep benchmarks & plotting scripts
-â””â”€â”€ deps/                       # Header-only dependencies (doctest, picosha2)
+|-- CMakeLists.txt              # CMake build configuration (C++20)
+|-- Dockerfile                  # Multi-stage Docker container build
+|-- docker-compose.yml          # Containerized simulation runner
+|-- .dockerignore               # Docker build ignore rules
+|-- .gitignore                  # Git ignore patterns
+|-- README.md                   # Project documentation
+|-- include/
+|   `-- coldchain/              # Header definitions
+|       |-- causal_merge_engine.hpp
+|       |-- config.hpp
+|       |-- events.hpp
+|       |-- hashing.hpp
+|       |-- iot_device.hpp
+|       |-- ledger_block.hpp
+|       |-- ledger_node.hpp
+|       |-- matrix_clock.hpp
+|       |-- metrics.hpp
+|       |-- network_simulator.hpp
+|       |-- physical_clock.hpp
+|       |-- pruning_engine.hpp
+|       `-- vector_clock.hpp
+|-- src/                        # Core implementation source files
+|   |-- causal_merge_engine.cpp
+|   |-- events.cpp
+|   |-- hashing.cpp
+|   |-- iot_device.cpp
+|   |-- ledger_block.cpp
+|   |-- ledger_node.cpp
+|   |-- main_sim.cpp
+|   |-- matrix_clock.cpp
+|   |-- metrics.cpp
+|   |-- network_simulator.cpp
+|   |-- physical_clock.cpp
+|   |-- pruning_engine.cpp
+|   `-- vector_clock.cpp
+|-- tests/                      # Unit and integration tests (doctest)
+|   |-- test_causal_merge.cpp
+|   |-- test_ledger_integrity.cpp
+|   |-- test_matrix_clock.cpp
+|   |-- test_network_simulator.cpp
+|   |-- test_pruning_safety.cpp
+|   `-- test_vector_clock.cpp
+|-- experiments/                # Parameter sweep benchmarks & plotting scripts
+|   |-- plot_results.py
+|   |-- run_all_sweeps.sh
+|   `-- sweep_runner.cpp
+`-- deps/                       # Header-only dependencies
+    |-- doctest.h
+    `-- picosha2.h
 ```
 
 ## Prerequisites
