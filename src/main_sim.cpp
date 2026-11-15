@@ -118,8 +118,16 @@ int main(int argc, char* argv[]) {
                 m.vclock.r_err_causal, m.fair_physical.r_err_causal, m.naive_receipt.r_err_causal, m.lamport.r_err_causal, 6);
     print_row_d("R_err (Total Denom)",
                 m.vclock.r_err_total, m.fair_physical.r_err_total, m.naive_receipt.r_err_total, m.lamport.r_err_total, 6);
-    print_row_d("False Liability (F_liab)",
-                m.vclock.f_liab, m.fair_physical.f_liab, m.naive_receipt.f_liab, m.lamport.f_liab, 4);
+    if (m.vclock.f_liab_defined) {
+        print_row_d("False Liability (F_liab)",
+                    m.vclock.f_liab, m.fair_physical.f_liab, m.naive_receipt.f_liab, m.lamport.f_liab, 4);
+    } else {
+        std::cout << std::left << std::setw(28) << "False Liability (F_liab)" << " | "
+                  << std::setw(11) << "N/A" << " | "
+                  << std::setw(12) << "N/A" << " | "
+                  << std::setw(12) << "N/A" << " | "
+                  << std::setw(11) << "N/A" << " (0 excursions in run)\n";
+    }
     print_row_d("Concurrent Misordering C_err",
                 m.vclock.c_err_concurrency, m.fair_physical.c_err_concurrency, m.naive_receipt.c_err_concurrency, m.lamport.c_err_concurrency, 4);
 

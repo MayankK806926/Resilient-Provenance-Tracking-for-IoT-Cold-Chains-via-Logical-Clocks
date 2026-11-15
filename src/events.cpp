@@ -15,6 +15,7 @@ std::string SensorEvent::serialize() const {
        << ':' << std::fixed << std::setprecision(4) << latitude
        << ':' << std::fixed << std::setprecision(4) << longitude
        << ':' << local_monotonic_counter
+       << ':' << custody_transfer_seq
        << ':' << vc.to_string();
     return os.str();
 }
@@ -29,6 +30,7 @@ std::string CustodyEvent::serialize() const {
        << ':' << static_cast<int>(from_entity_id)
        << ':' << static_cast<int>(to_entity_id)
        << ':' << custody_transfer_seq
+       << ':' << last_sensor_seq
        << ':' << vc.to_string();
     return os.str();
 }
@@ -87,7 +89,7 @@ uint32_t event_shipment_id(const LedgerEvent& ev) {
 
 Hash256 event_hash(const LedgerEvent& ev) {
     return std::visit([](const auto& e) {
-        if (e.id != Hash256{}) return e.id;
+        if (e.is_pruned && e.id != Hash256{}) return e.id;
         return e.compute_hash();
     }, ev);
 }

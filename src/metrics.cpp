@@ -57,6 +57,7 @@ PipelineMetrics evaluate_event_sequence(const std::vector<LedgerEvent>& events,
     size_t inversions = 0;
     size_t causally_related_pairs = 0;
     size_t concurrent_pairs = 0;
+    size_t concurrent_inversions = 0;
     size_t total_pairs = 0;
 
     for (size_t i = 0; i < n; ++i) {
@@ -80,8 +81,12 @@ PipelineMetrics evaluate_event_sequence(const std::vector<LedgerEvent>& events,
             } else if (i_precedes_j) {
                 ++causally_related_pairs;
             } else {
-                // Concurrent in ground truth
+                // Concurrent in ground truth: neither causally precedes the other
                 ++concurrent_pairs;
+                // Check if stored order (i before j) inverts true physical creation time
+                if (event_creation_time(events[j]) < event_creation_time(events[i])) {
+                    ++concurrent_inversions;
+                }
             }
         }
     }
@@ -94,14 +99,10 @@ PipelineMetrics evaluate_event_sequence(const std::vector<LedgerEvent>& events,
         ? static_cast<double>(inversions) / static_cast<double>(total_pairs)
         : 0.0;
 
-    // Concurrency metric: false ordering of concurrent pairs
-    // Vector clocks maintain partial order (they do not claim one caused the other),
-    // whereas scalar/physical clocks force an arbitrary total ordering.
-    if (!is_vclock_pipeline && total_pairs > 0) {
-        pm.c_err_concurrency = static_cast<double>(concurrent_pairs) / static_cast<double>(total_pairs);
-    } else {
-        pm.c_err_concurrency = 0.0; // Vector clock preserves concurrency
-    }
+    // Concurrency misordering metric: fraction of concurrent pairs where stored order contradicts true creation order
+    pm.c_err_concurrency = (concurrent_pairs > 0)
+        ? static_cast<double>(concurrent_inversions) / static_cast<double>(concurrent_pairs)
+        : 0.0;
 
     // Evaluate F_liab (False liability attribution)
     std::map<uint32_t, uint8_t> apparent_custody;
@@ -144,9 +145,14 @@ PipelineMetrics evaluate_event_sequence(const std::vector<LedgerEvent>& events,
         }
     }
 
-    pm.f_liab = (total_excursions > 0)
-        ? static_cast<double>(pm.misattributed_excursions) / static_cast<double>(total_excursions)
-        : 0.0;
+    pm.total_excursions = total_excursions;
+    if (total_excursions > 0) {
+        pm.f_liab_defined = true;
+        pm.f_liab = static_cast<double>(pm.misattributed_excursions) / static_cast<double>(total_excursions);
+    } else {
+        pm.f_liab_defined = false;
+        pm.f_liab = -1.0; // Undefined when no excursions occurred
+    }
 
     return pm;
 }
@@ -199,16 +205,14 @@ RunMetrics evaluate_simulation(NetworkSimulator& sim, const SimConfig& cfg) {
         }
     }
 
-    // 3. Baselines from all received events
-    std::vector<LedgerEvent> all_received = sim.ground_truth_events();
-
-    auto fair_phys_order = fair_creation_physical_order(all_received);
+    // 3. Baselines evaluated on the EXACT SAME delivered event set as the VC pipeline (replica 0)
+    auto fair_phys_order = fair_creation_physical_order(node0_events);
     rm.fair_physical     = evaluate_event_sequence(fair_phys_order, sim, cfg, /*is_vclock*/ false);
 
-    auto naive_rec_order = naive_receipt_order(all_received);
+    auto naive_rec_order = naive_receipt_order(node0_events);
     rm.naive_receipt     = evaluate_event_sequence(naive_rec_order, sim, cfg, /*is_vclock*/ false);
 
-    auto lamport_ord     = lamport_order(all_received);
+    auto lamport_ord     = lamport_order(node0_events);
     rm.lamport           = evaluate_event_sequence(lamport_ord, sim, cfg, /*is_vclock*/ false);
 
     // 4. Matrix clock gossip and pruning evaluation
@@ -239,7 +243,7 @@ RunMetrics evaluate_simulation(NetworkSimulator& sim, const SimConfig& cfg) {
     }
 
     rm.pruned_store_size   = pruned_total;
-    rm.safety_violations   = safety_violations;
+    rm.safety_violations   = sim.safety_violations_detected() + safety_violations;
     rm.storage_reduction_ratio = (unpruned_total > 0)
         ? (1.0 - static_cast<double>(pruned_total) / static_cast<double>(unpruned_total))
         : 1.0;

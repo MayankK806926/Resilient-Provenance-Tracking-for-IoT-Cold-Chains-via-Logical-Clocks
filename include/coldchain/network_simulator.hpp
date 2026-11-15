@@ -45,6 +45,7 @@ struct Shipment {
     double                   start_time_ms = 0.0;
     double                   next_sample_ms = 0.0;
     bool                     finished = false;
+    uint64_t                 custody_transfers_count = 0;
 };
 
 struct CustodyInterval {
@@ -123,14 +124,17 @@ private:
     bool is_node_in_blackout(uint8_t node_id, double time_ms) const;
     float sample_ambient_temperature(uint32_t shipment_id, double time_ms);
     double sample_tx_jitter();
+    double sample_handoff_delay();
 
     SimConfig cfg_;
     std::mt19937_64 rng_;
     double sim_clock_ms_ = 0.0;
+    double last_gossip_time_ms_ = 0.0;
 
     std::vector<Shipment> shipments_;
     std::vector<IoTDevice> shipment_loggers_;
     std::vector<DriftingPhysicalClock> shipment_clocks_;
+    std::vector<VectorClock> entity_vcs_;
 
     std::vector<LedgerNode> vclock_nodes_;
 

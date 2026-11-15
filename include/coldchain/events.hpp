@@ -20,6 +20,7 @@ struct SensorEvent {
     float       latitude;
     float       longitude;
     uint64_t    local_monotonic_counter;
+    uint64_t    custody_transfer_seq = 0; // Custody sequence under which reading was generated
     VectorClock vc;
     uint64_t    lamport_ts = 0;           // For scalar Lamport baseline comparison
     Hash256     signature{};
@@ -38,6 +39,7 @@ struct CustodyEvent {
     uint8_t     from_entity_id;
     uint8_t     to_entity_id;
     uint64_t    custody_transfer_seq;
+    uint64_t    last_sensor_seq = 0;      // Monotonic sensor counter at time of transfer
     VectorClock vc;
     uint64_t    lamport_ts = 0;
     Hash256     transfer_signature{};

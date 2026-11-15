@@ -5,6 +5,8 @@
 #include "coldchain/ledger_node.hpp"
 
 #include <cassert>
+#include <iostream>
+#include <set>
 
 namespace coldchain {
 
@@ -64,16 +66,25 @@ size_t PruningEngine::prune_stable_records(LedgerNode& node,
         }
     }
 
-    // Prune payload from all_events_ history while retaining hashes & Merkle commitments
+    // Prune payload from all_events_ history & chain while retaining hashes & Merkle commitments (O(N log M))
     if (!pruned_hashes.empty()) {
+        std::set<Hash256> pruned_set(pruned_hashes.begin(), pruned_hashes.end());
+
         auto& all_evs = node.all_events_mut();
         for (auto& ev : all_evs) {
             if (std::holds_alternative<SensorEvent>(ev)) {
-                Hash256 h = event_hash(ev);
-                for (const auto& ph : pruned_hashes) {
-                    if (h == ph) {
+                if (pruned_set.count(event_hash(ev))) {
+                    prune_event_payload(ev);
+                }
+            }
+        }
+
+        // Also prune payload in sealed blocks while maintaining Merkle tree proofs
+        for (auto& blk : node.chain_mut()) {
+            for (auto& ev : blk.events) {
+                if (std::holds_alternative<SensorEvent>(ev)) {
+                    if (pruned_set.count(event_hash(ev))) {
                         prune_event_payload(ev);
-                        break;
                     }
                 }
             }

@@ -142,3 +142,46 @@ TEST_CASE("Security: forged signature and unregistered entity rejection") {
     CHECK(node.all_events().empty());
 }
 
+TEST_CASE("Causal gating: custody event held back until preceding sensor readings arrive") {
+    LedgerNode node(0, 3);
+
+    VectorClock vc0(3); vc0.tick(0);
+    auto s1 = make_signed_sensor(0, vc0, 1);
+
+    vc0.tick(0);
+    auto s2 = make_signed_sensor(0, vc0, 2);
+
+    CustodyEvent ce;
+    ce.shipment_id = 1;
+    ce.from_entity_id = 0;
+    ce.to_entity_id = 1;
+    ce.custody_transfer_seq = 1;
+    ce.last_sensor_seq = 2; // Gated on readings 1 and 2
+    vc0.tick(0);
+    ce.vc = vc0;
+    ce.transfer_signature = sign_event(ce.serialize(), node_private_key(0));
+    ce.id = ce.compute_hash();
+
+    // Ingest custody event first (before s1 and s2 arrive)
+    node.ingest_event(ce);
+    CHECK(node.hold_back_count() == 1);
+    CHECK(node.all_events().empty());
+
+    // Ingest s1: custody still held back because s2 is missing
+    node.ingest_event(s1);
+    CHECK(node.all_events().size() == 1);
+    CHECK(node.hold_back_count() == 1);
+
+    // Ingest s2: unblocks custody event!
+    node.ingest_event(s2);
+    CHECK(node.hold_back_count() == 0);
+    CHECK(node.all_events().size() == 3);
+
+    // Stored order MUST be s1, s2, ce!
+    CHECK(std::holds_alternative<SensorEvent>(node.all_events()[0]));
+    CHECK(event_counter(node.all_events()[0]) == 1);
+    CHECK(std::holds_alternative<SensorEvent>(node.all_events()[1]));
+    CHECK(event_counter(node.all_events()[1]) == 2);
+    CHECK(std::holds_alternative<CustodyEvent>(node.all_events()[2]));
+}
+

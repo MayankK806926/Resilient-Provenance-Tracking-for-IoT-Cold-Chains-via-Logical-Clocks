@@ -34,6 +34,7 @@ public:
 
     // Chain and event accessors
     const std::vector<LedgerBlock>& chain() const;
+    std::vector<LedgerBlock>&       chain_mut();
     size_t pending_count() const;
     size_t hold_back_count() const;
     const std::vector<LedgerEvent>& all_events() const;

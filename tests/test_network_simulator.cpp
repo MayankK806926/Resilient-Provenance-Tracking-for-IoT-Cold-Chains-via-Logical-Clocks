@@ -62,9 +62,40 @@ TEST_CASE("NetworkSimulator full execution produces valid ground truth and zero 
     CHECK(sim.total_events_generated() > 0);
     CHECK(sim.ground_truth_events().size() == sim.total_events_generated());
 
+    // Delivery completeness: all replicas delivered every generated event with 0 stuck in hold-back
+    for (size_t i = 0; i < sim.num_nodes(); ++i) {
+        CHECK(sim.vclock_node(i).hold_back_count() == 0);
+        CHECK(sim.vclock_node(i).delivered_count() == sim.total_events_generated());
+    }
+
     RunMetrics m = evaluate_simulation(sim, cfg);
     // Proposal guarantee: Vector clock pipeline achieves 0 causal misorderings
     CHECK(m.vclock.inversions == 0);
     CHECK(m.vclock.r_err_causal == 0.0);
     CHECK(m.all_replicas_converged);
+    CHECK(m.safety_violations == 0);
+}
+
+TEST_CASE("Delivery completeness and zero R_err under partitions and blackouts across all replicas") {
+    SimConfig cfg;
+    cfg.num_shipments = 3;
+    cfg.duration_hours = 8.0;
+    cfg.blackout_rate_per_hour = 0.5;
+    cfg.partition_rate_per_hour = 0.5;
+    cfg.seed = 12345;
+
+    NetworkSimulator sim(cfg);
+    sim.run_full();
+
+    CHECK(sim.total_events_generated() > 0);
+    for (size_t i = 0; i < sim.num_nodes(); ++i) {
+        CHECK(sim.vclock_node(i).hold_back_count() == 0);
+        CHECK(sim.vclock_node(i).delivered_count() == sim.total_events_generated());
+    }
+
+    RunMetrics m = evaluate_simulation(sim, cfg);
+    CHECK(m.vclock.inversions == 0);
+    CHECK(m.vclock.r_err_causal == 0.0);
+    CHECK(m.all_replicas_converged);
+    CHECK(m.safety_violations == 0);
 }

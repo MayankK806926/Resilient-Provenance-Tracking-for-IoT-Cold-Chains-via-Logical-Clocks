@@ -32,9 +32,14 @@ public:
 
     const VectorClock& local_clock() const;
     VectorClock& local_clock_mut();
+    void set_local_clock(const VectorClock& vc);
 
     uint64_t current_lamport_ts() const;
     void merge_lamport_ts(uint64_t incoming_ts);
+
+    uint64_t current_counter() const;
+    uint64_t current_custody_seq() const;
+    void set_current_custody_seq(uint64_t seq);
 
     uint32_t shipment_id() const;
 
@@ -47,6 +52,7 @@ private:
     std::vector<SensorEvent> buffer_;
     bool         is_online_ = true;
     uint64_t     monotonic_counter_ = 0;
+    uint64_t     current_custody_seq_ = 0;
 };
 
 } // namespace coldchain

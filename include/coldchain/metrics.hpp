@@ -17,9 +17,11 @@ class NetworkSimulator;
 struct PipelineMetrics {
     double r_err_causal           = 0.0; // Inversions / causally-related pairs
     double r_err_total            = 0.0; // Inversions / all pairs
-    double f_liab                 = 0.0; // False liability attribution rate
-    double c_err_concurrency      = 0.0; // Falsely ordered concurrent pairs rate
+    double f_liab                 = 0.0; // False liability attribution rate (-1.0 if undefined)
+    bool   f_liab_defined         = false;
+    double c_err_concurrency      = 0.0; // Stored order inversions of concurrent pairs
     size_t inversions             = 0;
+    size_t total_excursions       = 0;
     size_t misattributed_excursions = 0;
     size_t masked_excursions      = 0;
     size_t ambiguous_excursions   = 0;

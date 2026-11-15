@@ -3,6 +3,7 @@
 
 #include "coldchain/network_simulator.hpp"
 #include "coldchain/causal_merge_engine.hpp"
+#include "coldchain/pruning_engine.hpp"
 
 #include <algorithm>
 #include <cassert>
@@ -14,6 +15,7 @@ NetworkSimulator::NetworkSimulator(const SimConfig& cfg)
     : cfg_(cfg), rng_(cfg.seed) {
     for (size_t i = 0; i < cfg_.num_nodes; ++i) {
         vclock_nodes_.emplace_back(static_cast<uint8_t>(i), cfg_.num_nodes, cfg_.events_per_block);
+        entity_vcs_.emplace_back(cfg_.num_nodes);
     }
 }
 
@@ -232,19 +234,25 @@ double NetworkSimulator::sample_tx_jitter() {
     return std::abs(dist(rng_));
 }
 
+double NetworkSimulator::sample_handoff_delay() {
+    if (cfg_.handoff_delay_mean_ms <= 0.0) return 0.0;
+    std::exponential_distribution<double> dist(1.0 / cfg_.handoff_delay_mean_ms);
+    return dist(rng_);
+}
+
 void NetworkSimulator::broadcast_event(const LedgerEvent& ev, uint8_t origin_node) {
     // Broadcast event to ALL nodes over simulated network links
     for (size_t target = 0; target < cfg_.num_nodes; ++target) {
+        double delay = (target == origin_node) ? 0.0 : sample_tx_jitter();
         if (cfg_.link_loss_probability > 0.0 && target != origin_node) {
             std::uniform_real_distribution<double> loss_dist(0.0, 1.0);
-            if (loss_dist(rng_) < cfg_.link_loss_probability) {
-                continue; // Packet dropped by lossy link
+            while (loss_dist(rng_) < cfg_.link_loss_probability) {
+                delay += 200.0; // Reliable transport / TCP retransmission timeout delay
             }
         }
 
-        double jitter = (target == origin_node) ? 0.0 : sample_tx_jitter();
         ScheduledMessage msg;
-        msg.fire_time_ms = sim_clock_ms_ + jitter;
+        msg.fire_time_ms = sim_clock_ms_ + delay;
         msg.from_node    = origin_node;
         msg.to_node      = static_cast<uint8_t>(target);
         msg.payload      = ev;
@@ -264,15 +272,43 @@ void NetworkSimulator::process_telemetry(Shipment& ship) {
     uint8_t current_custodian = leg.custodian;
     device.set_current_custodian(current_custodian);
 
+    bool was_offline = !device.is_online();
     bool blacked_out = is_node_in_blackout(current_custodian, sim_clock_ms_);
     device.set_online(!blacked_out);
 
     uint64_t sim_time_ns = static_cast<uint64_t>(sim_clock_ms_ * 1e6);
+
+    // Reconnection flush: flush any offline buffered readings immediately when connectivity is restored
+    if (was_offline && !blacked_out && device.buffered_count() > 0) {
+        if (cfg_.resync_at_reconnect) {
+            clock.resync(sim_time_ns);
+        }
+        auto buffered = device.flush_on_reconnect();
+        double base_jitter = sample_tx_jitter();
+        for (size_t bi = 0; bi < buffered.size(); ++bi) {
+            auto& b_se = buffered[bi];
+            uint64_t upload_offset_ns = static_cast<uint64_t>(bi) * 1'000'000ULL;
+            b_se.physical_timestamp_ns = clock.now_ns(sim_time_ns, b_se.temperature_celsius) + upload_offset_ns;
+
+            for (size_t target = 0; target < cfg_.num_nodes; ++target) {
+                ScheduledMessage msg;
+                msg.fire_time_ms = sim_clock_ms_ + base_jitter + static_cast<double>(bi) * 0.1;
+                msg.from_node    = current_custodian;
+                msg.to_node      = static_cast<uint8_t>(target);
+                msg.payload      = b_se;
+                msg.is_gossip    = false;
+                message_queue_.push(msg);
+            }
+        }
+    }
+
     float temp = sample_ambient_temperature(ship.shipment_id, sim_clock_ms_);
     float lat = 12.97f + 0.1f * current_custodian;
     float lon = 77.59f + 0.1f * current_custodian;
 
+    device.set_local_clock(entity_vcs_[current_custodian]);
     SensorEvent se = device.generate_telemetry(temp, lat, lon, sim_time_ns, &clock);
+    entity_vcs_[current_custodian] = device.local_clock();
 
     // Record ground truth event and register causal dependency
     size_t new_idx = ground_truth_.size();
@@ -339,14 +375,16 @@ void NetworkSimulator::process_custody_transfer(Shipment& ship) {
     }
 
     // Generate custody transfer event
-    auto& from_vc = device.local_clock_mut();
+    auto& from_vc = entity_vcs_[from_entity];
     from_vc.tick(from_entity);
+    device.set_local_clock(from_vc);
 
     CustodyEvent ce;
     ce.shipment_id          = ship.shipment_id;
     ce.from_entity_id       = from_entity;
     ce.to_entity_id         = to_entity;
-    ce.custody_transfer_seq = ++custody_seq_;
+    ce.custody_transfer_seq = ++ship.custody_transfers_count;
+    ce.last_sensor_seq      = device.current_counter();
     ce.vc                   = from_vc;
     ce.lamport_ts           = device.current_lamport_ts() + 1;
     ce.creation_time_ns     = static_cast<uint64_t>(sim_clock_ms_ * 1e6);
@@ -371,10 +409,11 @@ void NetworkSimulator::process_custody_transfer(Shipment& ship) {
         }
     }
 
+    double handoff_delay_ms = sample_handoff_delay();
     // Broadcast custody event after flushed readings
     for (size_t target = 0; target < cfg_.num_nodes; ++target) {
         ScheduledMessage msg;
-        msg.fire_time_ms = sim_clock_ms_ + base_jitter + static_cast<double>(buffered.size() + 1) * 0.1;
+        msg.fire_time_ms = sim_clock_ms_ + base_jitter + handoff_delay_ms + static_cast<double>(buffered.size() + 1) * 0.1;
         msg.from_node    = from_entity;
         msg.to_node      = static_cast<uint8_t>(target);
         msg.payload      = ce;
@@ -384,11 +423,13 @@ void NetworkSimulator::process_custody_transfer(Shipment& ship) {
 
     // Handoff protocol: recipient incorporates custody clock (if enabled)
     if (cfg_.handoff_merge_enabled) {
-        from_vc.tick(to_entity);
+        entity_vcs_[to_entity].merge(from_vc);
+        device.set_local_clock(entity_vcs_[to_entity]);
     }
 
     // Advance to next leg
     ship.current_leg_idx++;
+    device.set_current_custody_seq(ship.custody_transfers_count);
     device.set_current_custodian(to_entity);
 }
 
@@ -443,6 +484,22 @@ void NetworkSimulator::step(double delta_time_ms) {
         }
 
         deliver_pending_messages();
+
+        // Periodic mid-run gossip and pruning under matrix clock knowledge
+        if (cfg_.gossip_interval_s > 0.0 && sim_clock_ms_ - last_gossip_time_ms_ >= cfg_.gossip_interval_s * 1000.0) {
+            last_gossip_time_ms_ = sim_clock_ms_;
+            gossip_rounds(1);
+
+            for (auto& node : vclock_nodes_) {
+                PruningEngine::prune_stable_records(
+                    node,
+                    cfg_.temp_low_c,
+                    cfg_.temp_high_c,
+                    &vclock_nodes_,
+                    &safety_violations_
+                );
+            }
+        }
     }
 }
 
@@ -488,6 +545,12 @@ void NetworkSimulator::run_full() {
     while (!message_queue_.empty()) {
         sim_clock_ms_ = std::max(sim_clock_ms_, message_queue_.top().fire_time_ms);
         deliver_pending_messages();
+    }
+
+    // Post-condition: verify all events delivered and hold-back queues completely drained
+    for (size_t i = 0; i < vclock_nodes_.size(); ++i) {
+        assert(vclock_nodes_[i].hold_back_count() == 0 && "Hold-back queue must be 0 after simulation");
+        assert(vclock_nodes_[i].delivered_count() == ground_truth_.size() && "All events must be delivered to replica");
     }
 
     // Auto-seal final blocks

@@ -105,7 +105,7 @@ bool verify_merkle_proof(const Hash256& merkle_root,
     return current == merkle_root;
 }
 
-// Deterministic serialization of a block's content (excluding this_hash).
+// Deterministic serialization of a block's header commitment (excluding this_hash).
 static std::string serialize_block_content(const LedgerBlock& block) {
     std::ostringstream os;
     os << block.block_index << '|';
@@ -113,16 +113,11 @@ static std::string serialize_block_content(const LedgerBlock& block) {
     // Append prev_hash as hex
     os << hash_to_hex(block.prev_hash) << '|';
 
-    // Append merkle_root as hex
+    // Append merkle_root as hex (Merkle commitment over all block events)
     os << hash_to_hex(block.merkle_root) << '|';
 
-    // Append block_vc
-    os << block.block_vc.to_string() << '|';
-
-    // Serialize each event
-    for (const auto& ev : block.events) {
-        os << event_serialize(ev) << ';';
-    }
+    // Append block_vc summary
+    os << block.block_vc.to_string();
 
     return os.str();
 }

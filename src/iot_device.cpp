@@ -46,6 +46,7 @@ SensorEvent IoTDevice::generate_telemetry(float temperature, float lat, float lo
     ev.latitude                = lat;
     ev.longitude               = lon;
     ev.local_monotonic_counter = monotonic_counter_;
+    ev.custody_transfer_seq    = current_custody_seq_;
     ev.vc                      = local_vc_;
     ev.lamport_ts              = l_ts;
     ev.creation_time_ns        = true_sim_time_ns;
@@ -82,6 +83,10 @@ VectorClock& IoTDevice::local_clock_mut() {
     return local_vc_;
 }
 
+void IoTDevice::set_local_clock(const VectorClock& vc) {
+    local_vc_ = vc;
+}
+
 uint64_t IoTDevice::current_lamport_ts() const {
     return lamport_clock_.value();
 }
@@ -92,6 +97,18 @@ void IoTDevice::merge_lamport_ts(uint64_t incoming_ts) {
 
 uint32_t IoTDevice::shipment_id() const {
     return shipment_id_;
+}
+
+uint64_t IoTDevice::current_counter() const {
+    return monotonic_counter_;
+}
+
+uint64_t IoTDevice::current_custody_seq() const {
+    return current_custody_seq_;
+}
+
+void IoTDevice::set_current_custody_seq(uint64_t seq) {
+    current_custody_seq_ = seq;
 }
 
 } // namespace coldchain

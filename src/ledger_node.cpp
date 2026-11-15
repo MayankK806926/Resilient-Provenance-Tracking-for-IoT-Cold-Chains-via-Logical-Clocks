@@ -19,6 +19,19 @@ LedgerNode::LedgerNode(uint8_t node_id, size_t n_nodes, size_t events_per_block)
 
 bool LedgerNode::is_causally_ready(const LedgerEvent& ev) const {
     if (const auto* se = std::get_if<SensorEvent>(&ev)) {
+        // Gated on previous custody handoff: reading belongs to leg after handoff se->custody_transfer_seq
+        if (se->custody_transfer_seq > 0) {
+            uint64_t delivered_custody = 0;
+            auto cit = custody_sequences_.find(se->shipment_id);
+            if (cit != custody_sequences_.end()) {
+                delivered_custody = cit->second;
+            }
+            if (delivered_custody < se->custody_transfer_seq) {
+                return false; // Waiting for preceding custody handoff
+            }
+        }
+
+        // Gated on monotonic sensor counter for this shipment
         uint64_t expected_counter = 1;
         auto it = shipment_counters_.find(se->shipment_id);
         if (it != shipment_counters_.end()) {
@@ -28,21 +41,35 @@ bool LedgerNode::is_causally_ready(const LedgerEvent& ev) const {
             return false; // Gap in causal sequence for this shipment — hold back
         }
     } else if (const auto* ce = std::get_if<CustodyEvent>(&ev)) {
+        // Gated on per-shipment custody sequence (1, 2, 3...)
         uint64_t expected_seq = 1;
         auto it = custody_sequences_.find(ce->shipment_id);
         if (it != custody_sequences_.end()) {
             expected_seq = it->second + 1;
         }
         if (ce->custody_transfer_seq > expected_seq) {
-            return false;
+            return false; // Gap in custody handoffs for this shipment — hold back
+        }
+
+        // Gated on sender's prior sensor readings: all readings up to last_sensor_seq must be delivered!
+        auto sit = shipment_counters_.find(ce->shipment_id);
+        uint64_t delivered_sensor = (sit != shipment_counters_.end()) ? sit->second : 0;
+        if (delivered_sensor < ce->last_sensor_seq) {
+            return false; // Custody cannot precede sensor readings taken under prior custodian!
         }
     }
 
     // Classical causal delivery barrier (Schiper-Eggli-Sandoz):
-    // Replica must have already delivered all causal dependencies from other nodes k != origin:
-    // vc_e[k] <= local_vc_[k]
+    // 1. Origin sequence continuity: cannot deliver out-of-order event from origin
+    //    if earlier events from origin are missing
     const auto& vc_e = event_vc(ev);
     uint8_t origin = event_origin(ev);
+    if (vc_e[origin] > local_vc_[origin] + 1) {
+        return false;
+    }
+
+    // 2. Replica must have already delivered all causal dependencies from other nodes k != origin:
+    // vc_e[k] <= local_vc_[k]
     for (size_t k = 0; k < n_nodes_; ++k) {
         if (k != origin && vc_e[k] > local_vc_[k]) {
             return false; // Causal dependency on node k not yet delivered — hold back
@@ -204,6 +231,7 @@ bool LedgerNode::has_delivered(const Hash256& event_id) const {
 }
 
 const std::vector<LedgerBlock>& LedgerNode::chain() const     { return chain_; }
+std::vector<LedgerBlock>&       LedgerNode::chain_mut()       { return chain_; }
 size_t LedgerNode::pending_count() const                       { return pending_.size(); }
 size_t LedgerNode::hold_back_count() const                     { return hold_back_queue_.size(); }
 const std::vector<LedgerEvent>& LedgerNode::all_events() const { return all_events_; }
@@ -228,9 +256,25 @@ size_t LedgerNode::active_store_bytes() const {
 }
 
 size_t LedgerNode::total_memory_bytes() const {
-    size_t events_mem = all_events_.size() * sizeof(LedgerEvent);
+    size_t events_mem = 0;
+    for (const auto& ev : all_events_) {
+        if (event_is_pruned(ev)) {
+            events_mem += sizeof(Hash256) + sizeof(VectorClock); // Compact cryptographic commitment
+        } else {
+            events_mem += sizeof(SensorEvent);
+        }
+    }
     size_t store_mem  = active_store_bytes();
     size_t chain_mem  = chain_.size() * sizeof(LedgerBlock);
+    for (const auto& blk : chain_) {
+        for (const auto& ev : blk.events) {
+            if (event_is_pruned(ev)) {
+                chain_mem += sizeof(Hash256) + sizeof(VectorClock);
+            } else {
+                chain_mem += sizeof(SensorEvent);
+            }
+        }
+    }
     size_t hashes_mem = delivered_hashes_.size() * sizeof(Hash256);
     return events_mem + store_mem + chain_mem + hashes_mem;
 }
