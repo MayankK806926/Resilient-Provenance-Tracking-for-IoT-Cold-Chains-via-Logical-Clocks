@@ -141,3 +141,4 @@ TEST_CASE("Security: forged signature and unregistered entity rejection") {
     CHECK_FALSE(node.ingest_event(unreg_ev));
     CHECK(node.all_events().empty());
 }
+

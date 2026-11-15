@@ -79,3 +79,4 @@ TEST_CASE("Negative control: isolates clock drift vs gateway re-stamping") {
 
     CHECK(high_drift.now_ns(t2) != t2);
 }
+
