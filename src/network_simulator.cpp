@@ -4,19 +4,22 @@
 #include "coldchain/network_simulator.hpp"
 #include "coldchain/causal_merge_engine.hpp"
 #include "coldchain/pruning_engine.hpp"
+#include <iostream>
 
 #include <algorithm>
 #include <cassert>
 #include <cmath>
+#include <stdexcept>
+#include <string>
 
 namespace coldchain {
 
 NetworkSimulator::NetworkSimulator(const SimConfig& cfg)
     : cfg_(cfg), rng_(cfg.seed) {
     for (size_t i = 0; i < cfg_.num_nodes; ++i) {
-        vclock_nodes_.emplace_back(static_cast<uint8_t>(i), cfg_.num_nodes, cfg_.events_per_block);
-        entity_vcs_.emplace_back(cfg_.num_nodes);
+        vclock_nodes_.emplace_back(static_cast<uint8_t>(i), cfg_.num_nodes, cfg_.events_per_block, cfg_.num_shipments);
     }
+    entity_lamport_clocks_.resize(cfg_.num_nodes, 0);
 }
 
 void NetworkSimulator::add_shipment(uint32_t shipment_id, std::vector<uint8_t> route, double start_offset_hours) {
@@ -288,7 +291,9 @@ void NetworkSimulator::process_telemetry(Shipment& ship) {
         for (size_t bi = 0; bi < buffered.size(); ++bi) {
             auto& b_se = buffered[bi];
             uint64_t upload_offset_ns = static_cast<uint64_t>(bi) * 1'000'000ULL;
-            b_se.physical_timestamp_ns = clock.now_ns(sim_time_ns, b_se.temperature_celsius) + upload_offset_ns;
+            if (cfg_.restamp_physical_on_upload) {
+                b_se.physical_timestamp_ns = clock.now_ns(sim_time_ns, b_se.temperature_celsius) + upload_offset_ns;
+            }
 
             for (size_t target = 0; target < cfg_.num_nodes; ++target) {
                 ScheduledMessage msg;
@@ -306,9 +311,8 @@ void NetworkSimulator::process_telemetry(Shipment& ship) {
     float lat = 12.97f + 0.1f * current_custodian;
     float lon = 77.59f + 0.1f * current_custodian;
 
-    device.set_local_clock(entity_vcs_[current_custodian]);
+    // IoT device logs telemetry using its dedicated local clock
     SensorEvent se = device.generate_telemetry(temp, lat, lon, sim_time_ns, &clock);
-    entity_vcs_[current_custodian] = device.local_clock();
 
     // Record ground truth event and register causal dependency
     size_t new_idx = ground_truth_.size();
@@ -323,6 +327,11 @@ void NetworkSimulator::process_telemetry(Shipment& ship) {
     for (size_t prev_i = 0; prev_i < new_idx; ++prev_i) {
         if (event_shipment_id(ground_truth_[prev_i]) == ship.shipment_id) {
             gt_causality_matrix_[prev_i][new_idx] = true;
+            for (size_t k = 0; k < prev_i; ++k) {
+                if (gt_causality_matrix_[k][prev_i]) {
+                    gt_causality_matrix_[k][new_idx] = true;
+                }
+            }
         }
     }
 
@@ -361,7 +370,9 @@ void NetworkSimulator::process_custody_transfer(Shipment& ship) {
         // Re-stamp with upload offset if resyncing
         uint64_t upload_offset_ns = static_cast<uint64_t>(bi) * 1'000'000ULL;
         uint64_t reconnect_ns = static_cast<uint64_t>(sim_clock_ms_ * 1e6);
-        se.physical_timestamp_ns = clock.now_ns(reconnect_ns, se.temperature_celsius) + upload_offset_ns;
+        if (cfg_.restamp_physical_on_upload) {
+            se.physical_timestamp_ns = clock.now_ns(reconnect_ns, se.temperature_celsius) + upload_offset_ns;
+        }
 
         for (size_t target = 0; target < cfg_.num_nodes; ++target) {
             ScheduledMessage msg;
@@ -374,57 +385,131 @@ void NetworkSimulator::process_custody_transfer(Shipment& ship) {
         }
     }
 
-    // Generate custody transfer event
-    auto& from_vc = entity_vcs_[from_entity];
-    from_vc.tick(from_entity);
-    device.set_local_clock(from_vc);
+    // 1. Stage 1: Sender Departure Custody Event (ce_depart)
+    device.local_clock_mut().tick(from_entity);
+    uint64_t from_l_ts = std::max(entity_lamport_clocks_[from_entity], device.current_lamport_ts()) + 1;
+    entity_lamport_clocks_[from_entity] = from_l_ts;
+    device.merge_lamport_ts(from_l_ts);
 
-    CustodyEvent ce;
-    ce.shipment_id          = ship.shipment_id;
-    ce.from_entity_id       = from_entity;
-    ce.to_entity_id         = to_entity;
-    ce.custody_transfer_seq = ++ship.custody_transfers_count;
-    ce.last_sensor_seq      = device.current_counter();
-    ce.vc                   = from_vc;
-    ce.lamport_ts           = device.current_lamport_ts() + 1;
-    ce.creation_time_ns     = static_cast<uint64_t>(sim_clock_ms_ * 1e6);
-    ce.physical_timestamp_ns = clock.now_ns(ce.creation_time_ns, 4.0f);
-    ce.receipt_timestamp_ns = 0;
-    ce.is_pruned            = false;
-    ce.transfer_signature   = sign_event(ce.serialize(), node_private_key(from_entity));
-    ce.id                   = ce.compute_hash();
+    CustodyEvent ce_depart;
+    ce_depart.shipment_id          = ship.shipment_id;
+    ce_depart.from_entity_id       = from_entity;
+    ce_depart.to_entity_id         = to_entity;
+    ce_depart.origin_entity_id     = from_entity;
+    ce_depart.custody_transfer_seq = ++ship.custody_transfers_count;
+    ce_depart.last_sensor_seq      = device.current_counter();
+    ce_depart.vc                   = device.local_clock();
+    ce_depart.lamport_ts           = from_l_ts;
+    ce_depart.creation_time_ns     = static_cast<uint64_t>(sim_clock_ms_ * 1e6);
+    ce_depart.physical_timestamp_ns = clock.now_ns(ce_depart.creation_time_ns, 4.0f);
+    ce_depart.receipt_timestamp_ns = 0;
+    ce_depart.is_pruned            = false;
+    ce_depart.transfer_signature   = sign_event(ce_depart.serialize(), node_private_key(from_entity));
+    ce_depart.id                   = ce_depart.compute_hash();
 
-    size_t new_idx = ground_truth_.size();
-    ground_truth_.push_back(ce);
-    event_index_map_[ce.id] = new_idx;
+    size_t depart_idx = ground_truth_.size();
+    ground_truth_.push_back(ce_depart);
+    event_index_map_[ce_depart.id] = depart_idx;
 
-    // Ground-truth happens-before: custody event happens after all prior events of this shipment
-    gt_causality_matrix_.resize(new_idx + 1);
+    // Ground-truth happens-before: departure event happens after all prior events of this shipment
+    gt_causality_matrix_.resize(depart_idx + 1);
     for (auto& row : gt_causality_matrix_) {
-        row.resize(new_idx + 1, false);
+        row.resize(depart_idx + 1, false);
     }
-    for (size_t prev_i = 0; prev_i < new_idx; ++prev_i) {
+    for (size_t prev_i = 0; prev_i < depart_idx; ++prev_i) {
         if (event_shipment_id(ground_truth_[prev_i]) == ship.shipment_id) {
-            gt_causality_matrix_[prev_i][new_idx] = true;
+            gt_causality_matrix_[prev_i][depart_idx] = true;
+            for (size_t k = 0; k < prev_i; ++k) {
+                if (gt_causality_matrix_[k][prev_i]) {
+                    gt_causality_matrix_[k][depart_idx] = true;
+                }
+            }
         }
     }
 
     double handoff_delay_ms = sample_handoff_delay();
-    // Broadcast custody event after flushed readings
+    // Broadcast departure event after flushed readings
     for (size_t target = 0; target < cfg_.num_nodes; ++target) {
         ScheduledMessage msg;
         msg.fire_time_ms = sim_clock_ms_ + base_jitter + handoff_delay_ms + static_cast<double>(buffered.size() + 1) * 0.1;
         msg.from_node    = from_entity;
         msg.to_node      = static_cast<uint8_t>(target);
-        msg.payload      = ce;
+        msg.payload      = ce_depart;
         msg.is_gossip    = false;
         message_queue_.push(msg);
     }
 
-    // Handoff protocol: recipient incorporates custody clock (if enabled)
-    if (cfg_.handoff_merge_enabled) {
-        entity_vcs_[to_entity].merge(from_vc);
-        device.set_local_clock(entity_vcs_[to_entity]);
+    // 2. Stage 2: Receiver Arrival / Intake Custody Event (ce_recv)
+    VectorClock recv_vc = ce_depart.vc;
+    recv_vc.tick(to_entity);
+    device.set_local_clock(recv_vc);
+
+    // Receiver signs intake event with its local custodian Lamport clock
+    uint64_t recv_l_ts = std::max(entity_lamport_clocks_[to_entity], ce_depart.lamport_ts) + 1;
+    entity_lamport_clocks_[to_entity] = recv_l_ts;
+    device.merge_lamport_ts(recv_l_ts);
+
+    CustodyEvent ce_recv;
+    ce_recv.shipment_id          = ship.shipment_id;
+    ce_recv.from_entity_id       = from_entity;
+    ce_recv.to_entity_id         = to_entity;
+    ce_recv.origin_entity_id     = to_entity;
+    ce_recv.custody_transfer_seq = ++ship.custody_transfers_count;
+    ce_recv.last_sensor_seq      = device.current_counter();
+    ce_recv.vc                   = recv_vc;
+    ce_recv.lamport_ts           = recv_l_ts;
+    ce_recv.creation_time_ns     = static_cast<uint64_t>(sim_clock_ms_ * 1e6) + 1000ULL;
+    ce_recv.physical_timestamp_ns = clock.now_ns(ce_recv.creation_time_ns, 4.0f);
+    ce_recv.receipt_timestamp_ns = 0;
+    ce_recv.is_pruned            = false;
+    ce_recv.transfer_signature   = sign_event(ce_recv.serialize(), node_private_key(to_entity));
+    ce_recv.id                   = ce_recv.compute_hash();
+
+    size_t recv_idx = ground_truth_.size();
+    ground_truth_.push_back(ce_recv);
+    event_index_map_[ce_recv.id] = recv_idx;
+
+    gt_causality_matrix_.resize(recv_idx + 1);
+    for (auto& row : gt_causality_matrix_) {
+        row.resize(recv_idx + 1, false);
+    }
+
+    // (a) ce_depart strictly precedes ce_recv
+    gt_causality_matrix_[depart_idx][recv_idx] = true;
+
+    // (b) All prior events of this shipment strictly precede ce_recv
+    for (size_t prev_i = 0; prev_i < recv_idx; ++prev_i) {
+        if (event_shipment_id(ground_truth_[prev_i]) == ship.shipment_id) {
+            gt_causality_matrix_[prev_i][recv_idx] = true;
+            for (size_t k = 0; k < prev_i; ++k) {
+                if (gt_causality_matrix_[k][prev_i]) {
+                    gt_causality_matrix_[k][recv_idx] = true;
+                }
+            }
+        }
+    }
+
+    // (c) Prior events of this shipment strictly precede ce_recv
+    for (size_t prev_i = 0; prev_i < recv_idx; ++prev_i) {
+        if (event_shipment_id(ground_truth_[prev_i]) == ship.shipment_id) {
+            gt_causality_matrix_[prev_i][recv_idx] = true;
+            for (size_t k = 0; k < prev_i; ++k) {
+                if (gt_causality_matrix_[k][prev_i]) {
+                    gt_causality_matrix_[k][recv_idx] = true;
+                }
+            }
+        }
+    }
+
+    // Broadcast receive event after departure event
+    for (size_t target = 0; target < cfg_.num_nodes; ++target) {
+        ScheduledMessage msg;
+        msg.fire_time_ms = sim_clock_ms_ + base_jitter + handoff_delay_ms + static_cast<double>(buffered.size() + 2) * 0.1;
+        msg.from_node    = to_entity;
+        msg.to_node      = static_cast<uint8_t>(target);
+        msg.payload      = ce_recv;
+        msg.is_gossip    = false;
+        message_queue_.push(msg);
     }
 
     // Advance to next leg
@@ -547,10 +632,15 @@ void NetworkSimulator::run_full() {
         deliver_pending_messages();
     }
 
-    // Post-condition: verify all events delivered and hold-back queues completely drained
+    // Post-condition (explicit check; NOT compiled out in Release builds)
     for (size_t i = 0; i < vclock_nodes_.size(); ++i) {
-        assert(vclock_nodes_[i].hold_back_count() == 0 && "Hold-back queue must be 0 after simulation");
-        assert(vclock_nodes_[i].delivered_count() == ground_truth_.size() && "All events must be delivered to replica");
+        if (vclock_nodes_[i].hold_back_count() != 0) {
+            throw std::runtime_error("NetworkSimulator: hold-back queue not drained on node " + std::to_string(i));
+        }
+        if (vclock_nodes_[i].delivered_count() != ground_truth_.size()) {
+            throw std::runtime_error("NetworkSimulator: node " + std::to_string(i) + " delivered " +
+                std::to_string(vclock_nodes_[i].delivered_count()) + " of " + std::to_string(ground_truth_.size()) + " events");
+        }
     }
 
     // Auto-seal final blocks

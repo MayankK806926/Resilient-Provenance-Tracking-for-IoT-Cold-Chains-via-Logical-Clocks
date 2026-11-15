@@ -48,6 +48,10 @@ int main(int argc, char* argv[]) {
             base_cfg.duration_hours = std::stod(argv[++i]);
         } else if (arg == "--base-seed" && i + 1 < argc) {
             base_cfg.seed = std::stoull(argv[++i]);
+        } else if (arg == "--restamp") {
+            base_cfg.restamp_physical_on_upload = true;
+        } else if (arg == "--excursion-rate" && i + 1 < argc) {
+            base_cfg.excursion_rate_per_hour = std::stod(argv[++i]);
         } else if (arg == "--help" || arg == "-h") {
             std::cout << "Usage: ./sweep_runner [options]\n"
                       << "Options:\n"
@@ -58,6 +62,8 @@ int main(int argc, char* argv[]) {
                       << "  --shipments N                Number of shipments\n"
                       << "  --duration-hours H           Duration in hours\n"
                       << "  --base-seed S                Base random seed\n"
+                      << "  --restamp                    Enable gateway restamping on upload\n"
+                      << "  --excursion-rate R           Excursions per hour\n"
                       << "  --help, -h                   Show this message\n";
             return 0;
         }

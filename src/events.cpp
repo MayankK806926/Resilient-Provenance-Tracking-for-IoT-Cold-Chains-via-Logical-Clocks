@@ -26,9 +26,11 @@ Hash256 SensorEvent::compute_hash() const {
 
 std::string CustodyEvent::serialize() const {
     std::ostringstream os;
+    uint8_t orig = (origin_entity_id != 0 || from_entity_id == 0) ? origin_entity_id : from_entity_id;
     os << "CE:" << shipment_id
        << ':' << static_cast<int>(from_entity_id)
        << ':' << static_cast<int>(to_entity_id)
+       << ':' << static_cast<int>(orig)
        << ':' << custody_transfer_seq
        << ':' << last_sensor_seq
        << ':' << vc.to_string();
@@ -53,7 +55,7 @@ uint8_t event_origin(const LedgerEvent& ev) {
         if constexpr (std::is_same_v<T, SensorEvent>)
             return e.origin_entity_id;
         else
-            return e.from_entity_id;
+            return (e.origin_entity_id != 0 || e.from_entity_id == 0) ? e.origin_entity_id : e.from_entity_id;
     }, ev);
 }
 

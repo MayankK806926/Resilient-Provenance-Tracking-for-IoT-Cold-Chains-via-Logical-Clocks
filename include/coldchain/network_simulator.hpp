@@ -134,7 +134,7 @@ private:
     std::vector<Shipment> shipments_;
     std::vector<IoTDevice> shipment_loggers_;
     std::vector<DriftingPhysicalClock> shipment_clocks_;
-    std::vector<VectorClock> entity_vcs_;
+    std::vector<uint64_t> entity_lamport_clocks_;
 
     std::vector<LedgerNode> vclock_nodes_;
 

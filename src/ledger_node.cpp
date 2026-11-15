@@ -10,12 +10,17 @@
 
 namespace coldchain {
 
-LedgerNode::LedgerNode(uint8_t node_id, size_t n_nodes, size_t events_per_block)
+LedgerNode::LedgerNode(uint8_t node_id, size_t n_nodes, size_t events_per_block, size_t num_shipments)
     : node_id_(node_id),
       n_nodes_(n_nodes),
       events_per_block_(events_per_block),
       local_vc_(n_nodes),
-      mc_(n_nodes) {}
+      mc_(n_nodes),
+      num_shipments_(num_shipments) {
+    for (size_t s = 1; s <= num_shipments_; ++s) {
+        shipment_vcs_[static_cast<uint32_t>(s)] = VectorClock(n_nodes_);
+    }
+}
 
 bool LedgerNode::is_causally_ready(const LedgerEvent& ev) const {
     if (const auto* se = std::get_if<SensorEvent>(&ev)) {
@@ -59,23 +64,6 @@ bool LedgerNode::is_causally_ready(const LedgerEvent& ev) const {
         }
     }
 
-    // Classical causal delivery barrier (Schiper-Eggli-Sandoz):
-    // 1. Origin sequence continuity: cannot deliver out-of-order event from origin
-    //    if earlier events from origin are missing
-    const auto& vc_e = event_vc(ev);
-    uint8_t origin = event_origin(ev);
-    if (vc_e[origin] > local_vc_[origin] + 1) {
-        return false;
-    }
-
-    // 2. Replica must have already delivered all causal dependencies from other nodes k != origin:
-    // vc_e[k] <= local_vc_[k]
-    for (size_t k = 0; k < n_nodes_; ++k) {
-        if (k != origin && vc_e[k] > local_vc_[k]) {
-            return false; // Causal dependency on node k not yet delivered — hold back
-        }
-    }
-
     return true;
 }
 
@@ -88,8 +76,31 @@ void LedgerNode::deliver_event(LedgerEvent ev) {
     delivered_hashes_.insert(h);
     local_vc_.merge(event_vc(ev));
 
+    uint32_t sid = event_shipment_id(ev);
+    if (sid > 0) {
+        auto it = shipment_vcs_.find(sid);
+        if (it == shipment_vcs_.end()) {
+            shipment_vcs_[sid] = VectorClock(n_nodes_);
+        }
+        shipment_vcs_[sid].merge(event_vc(ev));
+    }
+
+    // Conservative stable progress across active shipments
+    VectorClock stable_vc(n_nodes_);
+    for (size_t k = 0; k < n_nodes_; ++k) {
+        uint32_t min_val = UINT32_MAX;
+        if (shipment_vcs_.empty()) {
+            min_val = local_vc_[k];
+        } else {
+            for (const auto& [id, vc] : shipment_vcs_) {
+                min_val = std::min(min_val, vc[k]);
+            }
+        }
+        stable_vc.set(k, (min_val == UINT32_MAX) ? 0 : min_val);
+    }
+
     // Update own row in matrix clock to reflect local delivery
-    mc_.set_own_row(local_vc_, node_id_);
+    mc_.set_own_row(stable_vc, node_id_);
 
     // Update causal sequence counters
     if (const auto* se = std::get_if<SensorEvent>(&ev)) {
@@ -230,6 +241,7 @@ bool LedgerNode::has_delivered(const Hash256& event_id) const {
     return delivered_hashes_.count(event_id) > 0;
 }
 
+const std::vector<LedgerEvent>& LedgerNode::hold_back_queue() const { return hold_back_queue_; }
 const std::vector<LedgerBlock>& LedgerNode::chain() const     { return chain_; }
 std::vector<LedgerBlock>&       LedgerNode::chain_mut()       { return chain_; }
 size_t LedgerNode::pending_count() const                       { return pending_.size(); }

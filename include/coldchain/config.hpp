@@ -46,6 +46,9 @@ struct SimConfig {
     double   initial_offset_max_s  = 5.0;
     bool     temp_dependent_drift  = true;
     bool     resync_at_reconnect   = true;
+    // If true, a gateway/device overwrites buffered readings' physical timestamps with the
+    // upload (reconnect) time. Default false: buffered readings keep their creation-time RTC stamp.
+    bool     restamp_physical_on_upload = false;
 
     // Network transmission jitter
     double   tx_jitter_mean_ms     = 50.0;

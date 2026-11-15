@@ -17,7 +17,7 @@ namespace coldchain {
 
 class LedgerNode {
 public:
-    LedgerNode(uint8_t node_id, size_t n_nodes, size_t events_per_block = 32);
+    explicit LedgerNode(uint8_t node_id, size_t n_nodes, size_t events_per_block = 32, size_t num_shipments = 1);
 
     // Ingest single event or batch through signature verification, topo-sort, and hold-back queue
     bool ingest_event(LedgerEvent ev, bool verify_sig = true, bool use_holdback = true);
@@ -37,6 +37,7 @@ public:
     std::vector<LedgerBlock>&       chain_mut();
     size_t pending_count() const;
     size_t hold_back_count() const;
+    const std::vector<LedgerEvent>& hold_back_queue() const;
     const std::vector<LedgerEvent>& all_events() const;
     std::vector<LedgerEvent>& all_events_mut();
 
@@ -74,6 +75,8 @@ private:
     std::vector<LedgerEvent> hold_back_queue_;
 
     std::set<Hash256> delivered_hashes_;
+    size_t num_shipments_ = 1;
+    std::map<uint32_t, VectorClock> shipment_vcs_;
     std::map<uint32_t, uint64_t> shipment_counters_;
     std::map<uint32_t, uint64_t> custody_sequences_;
     std::map<uint64_t, SensorEvent> active_state_store_;

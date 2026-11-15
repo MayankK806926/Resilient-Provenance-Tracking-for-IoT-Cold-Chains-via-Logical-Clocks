@@ -33,8 +33,7 @@ uint8_t find_true_custodian(uint64_t true_time_ns,
 
 PipelineMetrics evaluate_event_sequence(const std::vector<LedgerEvent>& events,
                                         const NetworkSimulator& sim,
-                                        const SimConfig& cfg,
-                                        bool is_vclock_pipeline) {
+                                        const SimConfig& cfg) {
     PipelineMetrics pm;
     const size_t n = events.size();
     if (n <= 1) return pm;
@@ -113,7 +112,13 @@ PipelineMetrics evaluate_event_sequence(const std::vector<LedgerEvent>& events,
         if (const auto* ce = std::get_if<CustodyEvent>(&ev)) {
             apparent_custody[ce->shipment_id] = ce->to_entity_id;
         } else if (const auto* se = std::get_if<SensorEvent>(&ev)) {
-            if (se->temperature_celsius < cfg.temp_low_c || se->temperature_celsius > cfg.temp_high_c) {
+            // Use the ORIGINAL reading from ground truth: stored payloads may have been pruned (zeroed).
+            float temp = se->temperature_celsius;
+            auto git = hash_to_gt.find(event_hash(ev));
+            if (git != hash_to_gt.end()) {
+                if (const auto* g = std::get_if<SensorEvent>(&gt_events[git->second])) temp = g->temperature_celsius;
+            }
+            if (temp < cfg.temp_low_c || temp > cfg.temp_high_c) {
                 ++total_excursions;
 
                 uint8_t true_custodian = find_true_custodian(se->creation_time_ns, se->shipment_id, intervals);
@@ -191,7 +196,7 @@ RunMetrics evaluate_simulation(NetworkSimulator& sim, const SimConfig& cfg) {
 
     // 1. Vector Clock pipeline stored order (replica 0 stored chain & events)
     const auto& node0_events = sim.vclock_node(0).all_events();
-    rm.vclock = evaluate_event_sequence(node0_events, sim, cfg, /*is_vclock*/ true);
+    rm.vclock = evaluate_event_sequence(node0_events, sim, cfg);
 
     // 2. Convergence across all replicas
     rm.all_replicas_converged = true;
@@ -207,13 +212,13 @@ RunMetrics evaluate_simulation(NetworkSimulator& sim, const SimConfig& cfg) {
 
     // 3. Baselines evaluated on the EXACT SAME delivered event set as the VC pipeline (replica 0)
     auto fair_phys_order = fair_creation_physical_order(node0_events);
-    rm.fair_physical     = evaluate_event_sequence(fair_phys_order, sim, cfg, /*is_vclock*/ false);
+    rm.fair_physical     = evaluate_event_sequence(fair_phys_order, sim, cfg);
 
     auto naive_rec_order = naive_receipt_order(node0_events);
-    rm.naive_receipt     = evaluate_event_sequence(naive_rec_order, sim, cfg, /*is_vclock*/ false);
+    rm.naive_receipt     = evaluate_event_sequence(naive_rec_order, sim, cfg);
 
     auto lamport_ord     = lamport_order(node0_events);
-    rm.lamport           = evaluate_event_sequence(lamport_ord, sim, cfg, /*is_vclock*/ false);
+    rm.lamport           = evaluate_event_sequence(lamport_ord, sim, cfg);
 
     // 4. Matrix clock gossip and pruning evaluation
     if (cfg.gossip_rounds > 0) {

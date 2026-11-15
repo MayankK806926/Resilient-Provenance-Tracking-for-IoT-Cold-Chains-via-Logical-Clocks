@@ -132,6 +132,7 @@ int main(int argc, char* argv[]) {
                 m.vclock.c_err_concurrency, m.fair_physical.c_err_concurrency, m.naive_receipt.c_err_concurrency, m.lamport.c_err_concurrency, 4);
 
     std::cout << "-----------------------------+-------------+--------------+--------------+-------------\n";
+    std::cout << "  Excursion samples evaluated (ground-truth readings): " << m.vclock.total_excursions << "\n";
 
     std::cout << "\n[Replicated Ledger Verification]\n"
               << "  Replica State Convergence:  " << (m.all_replicas_converged ? "CONVERGED (Identical canonical state hash)" : "FAILED (Divergent)") << "\n";

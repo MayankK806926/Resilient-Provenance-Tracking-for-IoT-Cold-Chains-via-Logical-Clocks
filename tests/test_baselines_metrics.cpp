@@ -125,3 +125,54 @@ TEST_CASE("Negative control: isolates clock drift vs gateway re-stamping") {
     CHECK(event_shipment_id(drift_sorted[0]) == 2);
 }
 
+
+TEST_CASE("F_liab is computed from original readings and is unaffected by mid-run pruning") {
+    SimConfig base;
+    base.num_shipments = 3;
+    base.duration_hours = 12.0;
+    base.excursion_rate_per_hour = 0.3;
+    base.seed = 11;
+
+    SimConfig with_prune = base;    with_prune.gossip_interval_s = 300.0;
+    SimConfig without_prune = base; without_prune.gossip_interval_s = 0.0;
+
+    RunMetrics a = run_single_experiment(with_prune);
+    RunMetrics b = run_single_experiment(without_prune);
+
+    CHECK(b.vclock.total_excursions > 0);
+    CHECK(a.vclock.total_excursions == b.vclock.total_excursions);
+    CHECK(a.fair_physical.misattributed_excursions == b.fair_physical.misattributed_excursions);
+    CHECK(a.naive_receipt.misattributed_excursions == b.naive_receipt.misattributed_excursions);
+    CHECK(a.vclock.misattributed_excursions == 0);
+}
+
+TEST_CASE("F_liab is undefined (not zero) when a run has no excursions") {
+    SimConfig cfg;
+    cfg.num_shipments = 2;
+    cfg.duration_hours = 6.0;
+    cfg.excursion_rate_per_hour = 0.0;
+    RunMetrics m = run_single_experiment(cfg);
+    CHECK(m.vclock.total_excursions == 0);
+    CHECK_FALSE(m.vclock.f_liab_defined);
+}
+
+TEST_CASE("Fair creation-time baseline: RTC drift alone causes no inversions; blackouts do not either without re-stamping") {
+    SimConfig cfg;
+    cfg.num_shipments = 3;
+    cfg.duration_hours = 12.0;
+    cfg.restamp_physical_on_upload = false;
+    cfg.seed = 5;
+
+    SimConfig no_blackout = cfg;
+    no_blackout.blackout_rate_per_hour = 0.0;
+    CHECK(run_single_experiment(no_blackout).fair_physical.inversions == 0);
+    CHECK(run_single_experiment(cfg).fair_physical.inversions == 0);
+
+    // Re-stamping at upload is what breaks the physical baseline.
+    SimConfig restamp = cfg;
+    restamp.restamp_physical_on_upload = true;
+    CHECK(run_single_experiment(restamp).fair_physical.inversions > 0);
+
+    // Vector-clock pipeline stays at zero in all of these settings.
+    CHECK(run_single_experiment(restamp).vclock.inversions == 0);
+}

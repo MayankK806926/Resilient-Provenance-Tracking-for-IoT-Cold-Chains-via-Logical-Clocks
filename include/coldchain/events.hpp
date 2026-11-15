@@ -35,10 +35,11 @@ struct SensorEvent {
 
 struct CustodyEvent {
     Hash256     id{};                     // Unique content hash of the event
-    uint32_t    shipment_id;
-    uint8_t     from_entity_id;
-    uint8_t     to_entity_id;
-    uint64_t    custody_transfer_seq;
+    uint32_t    shipment_id = 0;
+    uint8_t     from_entity_id = 0;
+    uint8_t     to_entity_id = 0;
+    uint8_t     origin_entity_id = 0;     // Custodian that emitted and signed this stage of handoff
+    uint64_t    custody_transfer_seq = 0;
     uint64_t    last_sensor_seq = 0;      // Monotonic sensor counter at time of transfer
     VectorClock vc;
     uint64_t    lamport_ts = 0;
