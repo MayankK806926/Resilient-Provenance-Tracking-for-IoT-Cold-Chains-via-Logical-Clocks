@@ -79,7 +79,7 @@ def plot_sweeps(input_csv: Path, output_dir: Path):
 
 def main():
     parser = argparse.ArgumentParser(description="Plot cold chain experiment results.")
-    parser.add_argument("--input", required=True, help="Input CSV path")
+    parser.add_argument("--input", default="data/sweeps/results.csv", help="Input CSV path (default: data/sweeps/results.csv)")
     parser.add_argument("--output-dir", default="data/sweeps", help="Output directory")
     args = parser.parse_args()
 
