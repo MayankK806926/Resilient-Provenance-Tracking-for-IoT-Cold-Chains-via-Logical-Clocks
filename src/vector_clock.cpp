@@ -11,10 +11,17 @@ namespace coldchain {
 
 VectorClock::VectorClock(size_t n) : clock_(n, 0) {}
 
+VectorClock::VectorClock(std::vector<uint32_t> clock) : clock_(std::move(clock)) {}
+
 void VectorClock::tick(size_t node_idx) {
     assert(node_idx < clock_.size() && "tick: index out of bounds");
     assert(clock_[node_idx] < UINT32_MAX && "tick: overflow guard");
     ++clock_[node_idx];
+}
+
+void VectorClock::set(size_t idx, uint32_t val) {
+    assert(idx < clock_.size() && "set: index out of bounds");
+    clock_[idx] = val;
 }
 
 void VectorClock::merge(const VectorClock& other) {
@@ -32,6 +39,14 @@ bool VectorClock::precedes(const VectorClock& other) const {
         if (clock_[k] < other.clock_[k]) at_least_one_strict = true;
     }
     return at_least_one_strict;
+}
+
+bool VectorClock::dominates_or_equal(const VectorClock& other) const {
+    assert(clock_.size() == other.clock_.size());
+    for (size_t k = 0; k < clock_.size(); ++k) {
+        if (clock_[k] < other.clock_[k]) return false;
+    }
+    return true;
 }
 
 bool VectorClock::is_concurrent(const VectorClock& other) const {
@@ -55,6 +70,10 @@ uint32_t VectorClock::sum() const {
     uint32_t s = 0;
     for (uint32_t v : clock_) s += v;
     return s;
+}
+
+const std::vector<uint32_t>& VectorClock::values() const {
+    return clock_;
 }
 
 std::string VectorClock::to_string() const {

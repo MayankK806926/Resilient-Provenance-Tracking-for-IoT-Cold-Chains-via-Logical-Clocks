@@ -1,59 +1,68 @@
 #pragma once
 /// @file metrics.hpp
-/// @brief Metrics computation (R_err, F_liab, S_prune).
+/// @brief Multi-pipeline metrics computation (R_err with dual denominators, F_liab, C_err, S_prune).
 
 #include <cstddef>
 #include <string>
 #include <vector>
 
+#include "coldchain/config.hpp"
 #include "coldchain/events.hpp"
 #include "coldchain/ledger_block.hpp"
-#include "coldchain/config.hpp"
 
 namespace coldchain {
 
-class LedgerNode;
 class NetworkSimulator;
 
+struct PipelineMetrics {
+    double r_err_causal           = 0.0; // Inversions / causally-related pairs
+    double r_err_total            = 0.0; // Inversions / all pairs
+    double f_liab                 = 0.0; // False liability attribution rate
+    double c_err_concurrency      = 0.0; // Falsely ordered concurrent pairs rate
+    size_t inversions             = 0;
+    size_t misattributed_excursions = 0;
+    size_t masked_excursions      = 0;
+    size_t ambiguous_excursions   = 0;
+};
+
 struct RunMetrics {
-    double causal_misordering_rate = 0.0; // R_err
-    double false_liability_rate    = 0.0; // F_liab
+    // Pipeline comparisons
+    PipelineMetrics vclock;          // Vector clock + causal merge engine
+    PipelineMetrics fair_physical;   // Fair creation-time drifting physical RTC
+    PipelineMetrics naive_receipt;   // Naive receipt-time arrival order
+    PipelineMetrics lamport;         // Lamport scalar clock
+
+    // Matrix pruning & storage metrics
     double storage_reduction_ratio = 0.0; // S_prune
-    double avg_blackout_hours      = 0.0;
-    size_t naive_inversions        = 0;
-    size_t vclock_inversions       = 0;
-    size_t total_events            = 0;
-    size_t total_excursions        = 0;
-    size_t false_liability_count   = 0;
     size_t unpruned_store_size     = 0;
     size_t pruned_store_size       = 0;
+    size_t safety_violations       = 0;   // Oracle safety invariant violations (must be 0)
+    size_t gossip_messages         = 0;
+    size_t gossip_bytes            = 0;
+
+    // Simulation metadata
+    double avg_blackout_hours      = 0.0;
+    double sampling_interval_s     = 60.0;
+    double drift_ppm_mean          = 50.0;
+    size_t total_events            = 0;
+    size_t total_excursions        = 0;
+    size_t total_blocks            = 0;
+    bool   all_replicas_converged  = false;
 };
 
-struct ExcursionRecord {
-    uint32_t shipment_id;
-    uint8_t  true_custodian;
-    float    temperature_celsius;
-    VectorClock vc;
-    uint64_t physical_timestamp_ns;
+struct AggregateMetrics {
+    double mean;
+    double stddev;
+    double ci95_low;
+    double ci95_high;
 };
 
-double compute_causal_misordering_rate(
-    const std::vector<LedgerEvent>& ordered_events,
-    size_t& out_inversion_count);
+AggregateMetrics compute_ci95(const std::vector<double>& values);
 
-double compute_false_liability_rate(
-    const std::vector<ExcursionRecord>& excursions,
-    const std::vector<LedgerEvent>& naive_events,
-    const SimConfig& cfg);
-
-double compute_storage_reduction(size_t pruned_size, size_t unbounded_size);
-
-std::vector<ExcursionRecord> extract_excursions(
-    const std::vector<LedgerEvent>& ground_truth,
-    const SimConfig& cfg);
-
+RunMetrics evaluate_simulation(NetworkSimulator& sim, const SimConfig& cfg);
 RunMetrics run_single_experiment(const SimConfig& cfg);
-std::string metrics_to_csv_row(const RunMetrics& m, uint64_t run_id);
+
 std::string metrics_csv_header();
+std::string metrics_to_csv_row(const RunMetrics& m, uint64_t run_id);
 
 } // namespace coldchain

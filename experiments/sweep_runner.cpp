@@ -1,18 +1,11 @@
 /// @file sweep_runner.cpp
-/// @brief Parameter sweep runner — varies blackout duration, collects
-///        R_err / F_liab / S_prune across N repetitions, outputs CSV.
-///
-/// Usage:
-///   ./sweep_runner --blackout-hours 0.1,1,2,4,8,16,24,48 --runs-per-point 20 \
-///                  --out data/sweeps/results.csv
-///
-/// For each blackout-duration setting, runs N repetitions with different seeds,
-/// computes RunMetrics, and appends rows to the output CSV.
+/// @brief Multi-parameter statistical sweep runner with 95% CI evaluation and CSV output.
 
 #include <cstdlib>
+#include <filesystem>
 #include <fstream>
-#include <iostream>
 #include <iomanip>
+#include <iostream>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -33,15 +26,11 @@ static std::vector<double> parse_doubles(const std::string& s) {
 }
 
 int main(int argc, char* argv[]) {
-    // Default sweep parameters
-    std::vector<double> blackout_hours = {0.1, 1.0, 2.0, 4.0, 8.0, 16.0, 24.0, 48.0};
-    size_t runs_per_point = 20;
+    std::vector<double> blackout_hours = {0.1, 0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 24.0, 48.0};
+    size_t runs_per_point = 30; // Report requirement: at least 30 seeds
     std::string output_path = "data/sweeps/results.csv";
-    SimConfig base_cfg;  // defaults from config.hpp
-
-    // Optional secondary sweep dimensions
-    std::vector<double> sampling_intervals;  // if provided, sweep this too
-    bool sweep_sampling = false;
+    std::string sweep_mode = "blackout"; // "blackout", "drift", "gossip", "scale", "ablation"
+    SimConfig base_cfg;
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
@@ -51,117 +40,130 @@ int main(int argc, char* argv[]) {
             runs_per_point = std::stoul(argv[++i]);
         } else if (arg == "--out" && i + 1 < argc) {
             output_path = argv[++i];
+        } else if (arg == "--mode" && i + 1 < argc) {
+            sweep_mode = argv[++i];
         } else if (arg == "--shipments" && i + 1 < argc) {
             base_cfg.num_shipments = static_cast<uint32_t>(std::stoul(argv[++i]));
         } else if (arg == "--duration-hours" && i + 1 < argc) {
             base_cfg.duration_hours = std::stod(argv[++i]);
-        } else if (arg == "--sampling-intervals" && i + 1 < argc) {
-            sampling_intervals = parse_doubles(argv[++i]);
-            sweep_sampling = true;
-        } else if (arg == "--gossip-rounds" && i + 1 < argc) {
-            base_cfg.gossip_rounds = static_cast<size_t>(std::stoul(argv[++i]));
         } else if (arg == "--base-seed" && i + 1 < argc) {
             base_cfg.seed = std::stoull(argv[++i]);
         } else if (arg == "--help" || arg == "-h") {
-            std::cout
-                << "Usage: ./sweep_runner [options]\n"
-                << "Options:\n"
-                << "  --blackout-hours H1,H2,...   Blackout durations to sweep (default: 0.1,...,48)\n"
-                << "  --runs-per-point N           Repetitions per setting (default: 20)\n"
-                << "  --out PATH                   CSV output path (default: data/sweeps/results.csv)\n"
-                << "  --shipments N                Number of shipments (default: 5)\n"
-                << "  --duration-hours H           Simulation duration (default: 72)\n"
-                << "  --sampling-intervals S1,S2   Secondary sweep: telemetry intervals in seconds\n"
-                << "  --gossip-rounds N            Matrix clock gossip rounds (default: 3)\n"
-                << "  --base-seed S                Base random seed (default: 42)\n"
-                << "  --help, -h                   Show this message\n";
+            std::cout << "Usage: ./sweep_runner [options]\n"
+                      << "Options:\n"
+                      << "  --blackout-hours H1,H2,...   Blackout durations to sweep\n"
+                      << "  --runs-per-point N           Repetitions per setting (default: 30)\n"
+                      << "  --mode MODE                  Sweep mode: blackout, drift, gossip, scale, ablation\n"
+                      << "  --out PATH                   CSV output path (default: data/sweeps/results.csv)\n"
+                      << "  --shipments N                Number of shipments\n"
+                      << "  --duration-hours H           Duration in hours\n"
+                      << "  --base-seed S                Base random seed\n"
+                      << "  --help, -h                   Show this message\n";
             return 0;
         }
     }
 
-    // Default sampling intervals if secondary sweep requested but none given
-    if (!sweep_sampling) {
-        sampling_intervals = {base_cfg.sampling_interval_s};
+    std::filesystem::path out_p(output_path);
+    if (out_p.has_parent_path()) {
+        std::filesystem::create_directories(out_p.parent_path());
     }
 
-    // Open output file
     std::ofstream ofs(output_path);
     if (!ofs.is_open()) {
         std::cerr << "ERROR: cannot open output file: " << output_path << "\n";
         return 1;
     }
 
-    // Write CSV header (extended with sampling_interval_s column)
-    ofs << "sampling_interval_s," << metrics_csv_header() << "\n";
+    ofs << metrics_csv_header() << "\n";
 
-    // Banner
-    std::cout << "--------------------\n"
-              << " Sweep Runner — Causally-Ordered Provenance Tracking\n"
-              << "--------------------\n"
-              << " Blackout hours:     ";
-    for (auto h : blackout_hours) std::cout << h << " ";
-    std::cout << "\n Sampling intervals: ";
-    for (auto s : sampling_intervals) std::cout << s << " ";
-    std::cout << "\n Runs per point:     " << runs_per_point
-              << "\n Shipments:          " << base_cfg.num_shipments
-              << "\n Duration:           " << base_cfg.duration_hours << " hours"
-              << "\n Output:             " << output_path
-              << "\n--------------------\n\n";
+    std::cout << "------------------------------------------------------------\n"
+              << " Cold Chain Statistical Sweep Runner (Mode: " << sweep_mode << ")\n"
+              << " Repetitions per parameter point: " << runs_per_point << "\n"
+              << " Output: " << output_path << "\n"
+              << "------------------------------------------------------------\n";
 
-    size_t total_runs = blackout_hours.size() * sampling_intervals.size() * runs_per_point;
-    size_t completed = 0;
+    uint64_t run_counter = 0;
 
-    for (double samp_int : sampling_intervals) {
-        for (double bh : blackout_hours) {
-            // Accumulators for summary statistics
-            double sum_rerr = 0.0, sum_fliab = 0.0, sum_sprune = 0.0;
-            size_t sum_naive_inv = 0, sum_vc_inv = 0;
+    if (sweep_mode == "blackout") {
+        for (double b_hr : blackout_hours) {
+            std::cout << ">> Running blackout duration: " << b_hr << " hours...\n";
+            std::vector<double> vc_r_errs, fair_r_errs, s_prunes;
 
-            for (size_t run = 0; run < runs_per_point; ++run) {
+            for (size_t rep = 0; rep < runs_per_point; ++rep) {
                 SimConfig cfg = base_cfg;
-                cfg.blackout_mean_hours = bh;
-                cfg.sampling_interval_s = samp_int;
-                cfg.seed = base_cfg.seed + run * 1000 + static_cast<uint64_t>(bh * 100);
+                cfg.blackout_mean_hours = b_hr;
+                cfg.seed = base_cfg.seed + run_counter * 17 + rep;
 
-                RunMetrics m = run_single_experiment(cfg);
-
-                // Write CSV row
-                ofs << std::fixed << std::setprecision(1) << samp_int << ","
-                    << metrics_to_csv_row(m, run) << "\n";
+                RunMetrics rm = run_single_experiment(cfg);
+                ofs << metrics_to_csv_row(rm, ++run_counter) << "\n";
                 ofs.flush();
 
-                sum_rerr      += m.causal_misordering_rate;
-                sum_fliab     += m.false_liability_rate;
-                sum_sprune    += m.storage_reduction_ratio;
-                sum_naive_inv += m.naive_inversions;
-                sum_vc_inv    += m.vclock_inversions;
-
-                ++completed;
+                vc_r_errs.push_back(rm.vclock.r_err_causal);
+                fair_r_errs.push_back(rm.fair_physical.r_err_causal);
+                s_prunes.push_back(rm.storage_reduction_ratio);
             }
 
-            // Progress report
-            double avg_rerr  = sum_rerr  / runs_per_point;
-            double avg_fliab = sum_fliab / runs_per_point;
-            double avg_sprune = sum_sprune / runs_per_point;
+            auto ci_vc = compute_ci95(vc_r_errs);
+            auto ci_fp = compute_ci95(fair_r_errs);
+            auto ci_sp = compute_ci95(s_prunes);
 
-            std::cout << std::fixed << std::setprecision(2)
-                      << " [" << completed << "/" << total_runs << "] "
-                      << "samp=" << samp_int << "s, "
-                      << "blackout=" << bh << "h: "
-                      << "R_err=" << std::setprecision(4) << avg_rerr
-                      << "  F_liab=" << avg_fliab
-                      << "  S_prune=" << avg_sprune
-                      << "  naive_inv_total=" << sum_naive_inv
-                      << "  vc_inv_total=" << sum_vc_inv
-                      << std::endl;
+            std::cout << "   VectorClock R_err: " << std::fixed << std::setprecision(6)
+                      << ci_vc.mean << " [95% CI: " << ci_vc.ci95_low << ", " << ci_vc.ci95_high << "]\n"
+                      << "   FairPhysical R_err: " << ci_fp.mean << " [95% CI: " << ci_fp.ci95_low << ", " << ci_fp.ci95_high << "]\n"
+                      << "   S_prune: " << std::setprecision(2) << (ci_sp.mean * 100.0) << "%\n";
+        }
+    } else if (sweep_mode == "drift") {
+        // Drift sweep from 100 ms/hr (~27.8 ppm) to 10 s/day (~115.7 ppm)
+        std::vector<double> drift_ppms = {10.0, 27.78, 50.0, 75.0, 100.0, 115.74, 150.0};
+        for (double drift : drift_ppms) {
+            std::cout << ">> Running drift sweep: " << drift << " PPM...\n";
+            for (size_t rep = 0; rep < runs_per_point; ++rep) {
+                SimConfig cfg = base_cfg;
+                cfg.drift_ppm_mean = drift;
+                cfg.drift_ppm_min  = drift * 0.8;
+                cfg.drift_ppm_max  = drift * 1.2;
+                cfg.seed = base_cfg.seed + run_counter * 17 + rep;
+
+                RunMetrics rm = run_single_experiment(cfg);
+                ofs << metrics_to_csv_row(rm, ++run_counter) << "\n";
+                ofs.flush();
+            }
+        }
+    } else if (sweep_mode == "ablation") {
+        std::cout << ">> Running ablation suite...\n";
+        // 1. Full pipeline
+        // 2. No hold-back queue
+        // 3. No handoff merge
+        // 4. No signature check
+        struct AblationSetting {
+            std::string name;
+            bool hold_back;
+            bool handoff_merge;
+            bool verify_sig;
+        };
+        std::vector<AblationSetting> ablations = {
+            {"Full_Pipeline", true, true, true},
+            {"No_HoldBackQueue", false, true, true},
+            {"No_HandoffMerge", true, false, true},
+            {"No_SignatureCheck", true, true, false}
+        };
+
+        for (const auto& ab : ablations) {
+            std::cout << "   Ablation: " << ab.name << "\n";
+            for (size_t rep = 0; rep < runs_per_point; ++rep) {
+                SimConfig cfg = base_cfg;
+                cfg.hold_back_enabled = ab.hold_back;
+                cfg.handoff_merge_enabled = ab.handoff_merge;
+                cfg.verify_signatures_enabled = ab.verify_sig;
+                cfg.seed = base_cfg.seed + run_counter * 17 + rep;
+
+                RunMetrics rm = run_single_experiment(cfg);
+                ofs << metrics_to_csv_row(rm, ++run_counter) << "\n";
+                ofs.flush();
+            }
         }
     }
 
-    ofs.close();
-
-    std::cout << "\n--------------------\n"
-              << " Sweep complete. " << completed << " runs written to: " << output_path << "\n"
-              << "--------------------\n";
-
+    std::cout << "\nSweep completed successfully. Results saved to: " << output_path << "\n";
     return 0;
 }

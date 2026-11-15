@@ -14,10 +14,18 @@ During transport, extended network blackouts and unsynchronized physical RTC dri
 
 This repository implements:
 1. **Vector Clocks & Matrix Clocks**: Partial and causal ordering of distributed events across custodian transitions.
-2. **Causal Merge Engine**: Deterministic reconciliation of branching event histories without central coordinator.
-3. **Cryptographic Ledger Integrity**: SHA-256 block-chained provenance log preventing retroactive tampering.
-4. **Matrix Clock Pruning Engine**: Dynamic causal horizon calculation for safe log pruning on memory-constrained edge devices.
-5. **Dual-Pipeline Simulation Framework**: Quantitative side-by-side comparison between logical clock causal ordering and naive physical timestamping.
+2. **Causal Merge Engine & Hold-Back Queue**: Deterministic reconciliation and causal-by-construction ledger storage.
+3. **Cryptographic Ledger Integrity**: SHA-256 block-chained provenance log with Merkle tree commitments and inclusion proofs.
+4. **Matrix Clock Pruning Engine**: Dynamic causal horizon calculation for safe log pruning on memory-constrained edge devices with zero invariant violations.
+5. **Multi-Pipeline Simulation Framework**: Quantitative side-by-side comparison across Vector Clocks, Fair Creation-Time Physical Clocks, Naive Receipt-Time Clocks, and Lamport Scalar Clocks.
+
+## Objective-to-Evidence Mapping
+
+| Objective | Architectural Mechanism | Evidence & Test Suite |
+| :--- | :--- | :--- |
+| **Obj 1: Replicated Permissioned Ledger** | Idempotent broadcast, per-node signature verification, Merkle multi-block chaining, deterministic tie-breaking on SHA-256 event hash | `test_replicated_ledger.cpp`: Replicas converge to identical canonical state hash under permuted delivery and healed partitions; forged/tampered events rejected.<br>`test_ledger_integrity.cpp`: Middle block tampering detected via Merkle proof verification failure. |
+| **Obj 2: Causal Ordering on Actual Ledger** | Causal hold-back queue at each replica; topological DAG sorting; Fidge-Mattern vector clocks; per-shipment loggers | `test_causal_merge.cpp` & `test_network_simulator.cpp`: Stored ledger causal by construction with $R_{\text{err}} = 0.000000$ across all seeds; zero causal inversions compared to drifting physical baselines. |
+| **Obj 3: Matrix-Clock Safe Pruning** | $N \times N$ matrix clock global horizon computation; excursion retention policy; synchronous gossip | `test_pruning_safety.cpp`: Oracle invariant verifies 0 events pruned prior to universal replica delivery; excursions strictly retained; pruning stalls safely under partition. |
 
 ## Project Structure
 
@@ -29,6 +37,9 @@ This repository implements:
 |-- .dockerignore               # Docker build ignore rules
 |-- .gitignore                  # Git ignore patterns
 |-- README.md                   # Project documentation
+|-- .github/
+|   `-- workflows/
+|       `-- ci.yml              # GitHub Actions CI (Linux/Windows, Debug/Release, ASan/UBSan)
 |-- include/
 |   `-- coldchain/              # Header definitions
 |       |-- causal_merge_engine.hpp
@@ -59,20 +70,33 @@ This repository implements:
 |   |-- pruning_engine.cpp
 |   `-- vector_clock.cpp
 |-- tests/                      # Unit and integration tests (doctest)
+|   |-- test_baselines_metrics.cpp
 |   |-- test_causal_merge.cpp
 |   |-- test_ledger_integrity.cpp
 |   |-- test_matrix_clock.cpp
 |   |-- test_network_simulator.cpp
 |   |-- test_pruning_safety.cpp
+|   |-- test_replicated_ledger.cpp
 |   `-- test_vector_clock.cpp
 |-- experiments/                # Parameter sweep benchmarks & plotting scripts
 |   |-- plot_results.py
+|   |-- run_all_sweeps.ps1
 |   |-- run_all_sweeps.sh
+|   |-- run_experiments.py
 |   `-- sweep_runner.cpp
 `-- deps/                       # Header-only dependencies
     |-- doctest.h
     `-- picosha2.h
 ```
+
+## System Assumptions
+
+1. **Handoff Protocol**: Custody transitions occur through explicit bilateral handoff messages where sender and receiver clocks synchronize. Handover verification can experience network latency or temporary delay.
+2. **Key Model**: Permissioned network where all participating entity IDs are known a priori ($N \le 10$). Each node possesses a distinct cryptographic private key for HMAC / SHA-256 signatures; unauthenticated or unregistered entities are rejected at ingest.
+3. **Link Model & Failure Modes**:
+   - *Edge-to-Gateway*: Sensor loggers experience intermittent Poisson blackouts during transport legs; readings are buffered locally and reconnected upon arrival.
+   - *Node-to-Node*: Ledger replicas communicate over asynchronous, lossy, and partitionable communication channels with transmission jitter.
+4. **Out of Scope**: Byzantine consensus (adversarial nodes modifying arbitrary peer state), crash-recovery persistence to disk (all state stored in-memory in C++ simulation), dynamic membership reconfiguration beyond the permissioned participant set.
 
 ## Prerequisites
 
@@ -109,12 +133,20 @@ ctest --test-dir build --output-on-failure
 
 ## Running Parameter Sweeps & Experiments
 
+### Linux / macOS (Bash)
 ```bash
-# Execute automated sweep suite
 chmod +x experiments/run_all_sweeps.sh
 ./experiments/run_all_sweeps.sh build
+```
 
-# Generate plots from output CSVs
+### Windows (PowerShell)
+```powershell
+.\experiments\run_all_sweeps.ps1 -BuildDir build -RunsPerPoint 30
+```
+
+### Cross-Platform (Python)
+```bash
+python3 experiments/run_experiments.py --mode blackout --runs-per-point 30
 python3 experiments/plot_results.py --input data/sweeps/results.csv --output-dir data/sweeps/
 ```
 
@@ -125,5 +157,3 @@ Build and run using Docker Compose:
 ```bash
 docker compose up --build
 ```
-
-

@@ -84,6 +84,24 @@ TEST_CASE("VectorClock merge algebraic properties: idempotence, commutativity, a
     CHECK(lhs == rhs);
 }
 
+TEST_CASE("VectorClock vector constructor and set method") {
+    std::vector<uint32_t> init = {3, 7, 1, 9};
+    VectorClock vc(init);
+    CHECK(vc.size() == 4);
+    CHECK(vc[0] == 3);
+    CHECK(vc[1] == 7);
+    CHECK(vc[2] == 1);
+    CHECK(vc[3] == 9);
+    CHECK(vc.values() == init);
+
+    vc.set(2, 42);
+    CHECK(vc[2] == 42);
+
+    VectorClock other({3, 7, 40, 9});
+    CHECK(vc.dominates_or_equal(other));
+    CHECK_FALSE(other.dominates_or_equal(vc));
+}
+
 TEST_CASE("VectorClock precedes: strict happens-before relation") {
     VectorClock a(4);
     VectorClock b(4);

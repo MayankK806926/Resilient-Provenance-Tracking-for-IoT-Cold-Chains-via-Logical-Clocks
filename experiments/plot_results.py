@@ -1,176 +1,89 @@
 #!/usr/bin/env python3
 """
-plot_results.py — Evaluation Plotter for Project Proposal (§4.1)
-
-Generates the three promised empirical evaluation plots:
-  1. Causal Misordering Rate (R_err) vs. Average Offline Duration (§4.1)
-  2. False Liability Attribution Rate (F_liab) vs. Average Offline Duration (§4.1)
-  3. State Consolidation & Autonomous Log Pruning (S_prune) vs. Offline Duration (§2.3, §3.2)
+plot_results.py — Generates publication-ready plots comparing Vector Clock
+vs Fair Physical vs Naive vs Lamport baselines.
 """
 
 import argparse
-import os
 import sys
+from pathlib import Path
 
-import pandas as pd
-import matplotlib
-matplotlib.use('Agg')
-import matplotlib.pyplot as plt
-import matplotlib.ticker as ticker
-import numpy as np
+def plot_sweeps(input_csv: Path, output_dir: Path):
+    try:
+        import pandas as pd
+        import matplotlib.pyplot as plt
+    except ImportError:
+        print("WARNING: pandas or matplotlib not installed. Skipping plot rendering.")
+        return
 
+    output_dir.mkdir(parents=True, exist_ok=True)
+    df = pd.read_csv(input_csv)
 
-def load_data(csv_path: str) -> pd.DataFrame:
-    if not os.path.exists(csv_path):
-        print(f"ERROR: CSV not found: {csv_path}", file=sys.stderr)
-        sys.exit(1)
+    # Group by blackout_hours and compute mean and std
+    if "blackout_hours" in df.columns:
+        grouped = df.groupby("blackout_hours").mean(numeric_only=True)
+        std = df.groupby("blackout_hours").std(numeric_only=True)
 
-    df = pd.read_csv(csv_path)
-    required = ['blackout_hours', 'r_err', 'f_liab', 's_prune',
-                'unpruned_store', 'pruned_store']
-    missing = [c for c in required if c not in df.columns]
-    if missing:
-        print(f"ERROR: Missing columns: {missing}", file=sys.stderr)
-        sys.exit(1)
+        # Plot 1: R_err comparison across pipelines
+        plt.figure(figsize=(8, 5))
+        if "vc_r_err_causal" in grouped.columns:
+            plt.plot(grouped.index, grouped["vc_r_err_causal"], 'o-', label="Vector Clock (Guaranteed 0)", color="#2ca02c", linewidth=2.5)
+        if "fair_r_err_causal" in grouped.columns:
+            plt.plot(grouped.index, grouped["fair_r_err_causal"], 's--', label="Fair Physical (Creation RTC)", color="#1f77b4")
+        if "naive_r_err_causal" in grouped.columns:
+            plt.plot(grouped.index, grouped["naive_r_err_causal"], '^:', label="Naive Receipt Baseline", color="#d62728")
+        if "lamport_r_err_causal" in grouped.columns:
+            plt.plot(grouped.index, grouped["lamport_r_err_causal"], 'd-.', label="Lamport Scalar Clock", color="#9467bd")
 
-    return df
+        plt.xlabel("Mean Blackout Duration (Hours)")
+        plt.ylabel("Causal Misordering Rate ($R_{err}$)")
+        plt.title("Causal Inversion Rate vs Blackout Duration")
+        plt.grid(True, linestyle="--", alpha=0.6)
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(output_dir / "r_err_comparison.png", dpi=300)
+        plt.close()
 
+        # Plot 2: F_liab comparison
+        plt.figure(figsize=(8, 5))
+        if "vc_f_liab" in grouped.columns:
+            plt.plot(grouped.index, grouped["vc_f_liab"], 'o-', label="Vector Clock (Zero Penalty)", color="#2ca02c", linewidth=2.5)
+        if "fair_f_liab" in grouped.columns:
+            plt.plot(grouped.index, grouped["fair_f_liab"], 's--', label="Fair Physical Baseline", color="#1f77b4")
+        if "naive_f_liab" in grouped.columns:
+            plt.plot(grouped.index, grouped["naive_f_liab"], '^:', label="Naive Receipt Baseline", color="#d62728")
 
-def plot_rerr(df: pd.DataFrame, output_dir: str):
-    """Plot R_err vs average offline duration (§4.1)."""
-    grouped = df.groupby('blackout_hours').agg(
-        naive_rerr_mean=('r_err', 'mean'),
-        naive_rerr_std=('r_err', 'std'),
-    ).reset_index()
+        plt.xlabel("Mean Blackout Duration (Hours)")
+        plt.ylabel("False Liability Attribution Rate ($F_{liab}$)")
+        plt.title("False Custody Attribution vs Network Blackouts")
+        plt.grid(True, linestyle="--", alpha=0.6)
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(output_dir / "f_liab_comparison.png", dpi=300)
+        plt.close()
 
-    fig, ax = plt.subplots(figsize=(10, 6))
+        # Plot 3: S_prune storage consolidation
+        if "s_prune" in grouped.columns:
+            plt.figure(figsize=(8, 5))
+            plt.plot(grouped.index, grouped["s_prune"] * 100.0, 'o-', color="#ff7f0e", linewidth=2.5)
+            plt.xlabel("Mean Blackout Duration (Hours)")
+            plt.ylabel("State Storage Reduction ($S_{prune}$ %)")
+            plt.title("Matrix-Clock Garbage Collection Efficiency")
+            plt.ylim(0, 105)
+            plt.grid(True, linestyle="--", alpha=0.6)
+            plt.tight_layout()
+            plt.savefig(output_dir / "s_prune_efficiency.png", dpi=300)
+            plt.close()
 
-    ax.errorbar(grouped['blackout_hours'], grouped['naive_rerr_mean'],
-                yerr=grouped['naive_rerr_std'],
-                fmt='o-', color='#e74c3c', linewidth=2, markersize=8,
-                capsize=5, capthick=1.5, elinewidth=1.5,
-                label='Naive Physical-Timestamp Baseline (with drift & jitter)',
-                zorder=3)
-
-    ax.axhline(y=0, color='#2ecc71', linewidth=2.5, linestyle='--',
-               label='Causal-Order Pipeline (guaranteed zero violations)', zorder=2)
-
-    ax.set_xlabel('Average Offline Duration (hours)', fontsize=13)
-    ax.set_ylabel('Causal Misordering Rate ($R_{err}$)', fontsize=13)
-    ax.set_title('Causal Misordering Rate ($R_{err}$) vs. Average Offline Duration', fontsize=14, fontweight='bold')
-    ax.set_xscale('log')
-    ax.xaxis.set_major_formatter(ticker.ScalarFormatter())
-    ax.legend(fontsize=11, loc='upper left')
-    ax.grid(True, alpha=0.3)
-    ax.set_ylim(bottom=-0.01)
-
-    fig.tight_layout()
-    path = os.path.join(output_dir, 'rerr_vs_blackout.png')
-    fig.savefig(path, dpi=150, bbox_inches='tight')
-    print(f"  Saved: {path}")
-    plt.close(fig)
-
-
-def plot_fliab(df: pd.DataFrame, output_dir: str):
-    """Plot F_liab vs average offline duration (§4.1)."""
-    grouped = df.groupby('blackout_hours').agg(
-        fliab_mean=('f_liab', 'mean'),
-        fliab_std=('f_liab', 'std'),
-    ).reset_index()
-
-    fig, ax = plt.subplots(figsize=(10, 6))
-
-    ax.errorbar(grouped['blackout_hours'], grouped['fliab_mean'],
-                yerr=grouped['fliab_std'],
-                fmt='s-', color='#e67e22', linewidth=2, markersize=8,
-                capsize=5, capthick=1.5, elinewidth=1.5,
-                label='Naive Physical-Timestamp Baseline (misattribution due to drift)',
-                zorder=3)
-
-    ax.axhline(y=0, color='#2ecc71', linewidth=2.5, linestyle='--',
-               label='Causal-Order Pipeline (zero false liability attribution)', zorder=2)
-
-    ax.set_xlabel('Average Offline Duration (hours)', fontsize=13)
-    ax.set_ylabel('False Liability Attribution Rate ($F_{liab}$)', fontsize=13)
-    ax.set_title('False Liability Attribution Rate ($F_{liab}$) vs. Offline Duration',
-                 fontsize=14, fontweight='bold')
-    ax.set_xscale('log')
-    ax.xaxis.set_major_formatter(ticker.ScalarFormatter())
-    ax.legend(fontsize=11, loc='upper left')
-    ax.grid(True, alpha=0.3)
-    ax.set_ylim(bottom=-0.01)
-
-    fig.tight_layout()
-    path = os.path.join(output_dir, 'fliab_vs_blackout.png')
-    fig.savefig(path, dpi=150, bbox_inches='tight')
-    print(f"  Saved: {path}")
-    plt.close(fig)
-
-
-def plot_storage(df: pd.DataFrame, output_dir: str):
-    """Plot State Consolidation / Log Pruning (S_prune) vs offline duration (§2.3, §3.2)."""
-    grouped = df.groupby('blackout_hours').agg(
-        sprune_mean=('s_prune', 'mean'),
-        sprune_std=('s_prune', 'std'),
-        unpruned_mean=('unpruned_store', 'mean'),
-        pruned_mean=('pruned_store', 'mean'),
-    ).reset_index()
-
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
-
-    ax1.errorbar(grouped['blackout_hours'], grouped['sprune_mean'] * 100,
-                 yerr=grouped['sprune_std'] * 100,
-                 fmt='D-', color='#3498db', linewidth=2, markersize=8,
-                 capsize=5, capthick=1.5, elinewidth=1.5,
-                 label='State Consolidation Ratio ($S_{prune}$)', zorder=3)
-    ax1.set_xlabel('Average Offline Duration (hours)', fontsize=13)
-    ax1.set_ylabel('Storage Reduction Ratio ($S_{prune}$) %', fontsize=13)
-    ax1.set_title('Matrix-Clock Autonomous Log-Pruning Efficiency', fontsize=14, fontweight='bold')
-    ax1.set_xscale('log')
-    ax1.xaxis.set_major_formatter(ticker.ScalarFormatter())
-    ax1.legend(fontsize=11)
-    ax1.grid(True, alpha=0.3)
-    ax1.set_ylim(bottom=-5, top=105)
-
-    x = np.arange(len(grouped))
-    width = 0.35
-    ax2.bar(x - width/2, grouped['unpruned_mean'], width,
-            color='#e74c3c', alpha=0.8, label='Unbounded Active Store (No GC)')
-    ax2.bar(x + width/2, grouped['pruned_mean'], width,
-            color='#2ecc71', alpha=0.8, label='Pruned Active Store (Matrix-Clock GC)')
-    ax2.set_xlabel('Average Offline Duration (hours)', fontsize=13)
-    ax2.set_ylabel('Active Memory Records', fontsize=13)
-    ax2.set_title('State Consolidation: Active Records in Memory', fontsize=14, fontweight='bold')
-    ax2.set_xticks(x)
-    ax2.set_xticklabels([f'{h:.1f}' for h in grouped['blackout_hours']])
-    ax2.legend(fontsize=11)
-    ax2.grid(True, alpha=0.3, axis='y')
-
-    fig.tight_layout()
-    path = os.path.join(output_dir, 'storage_reduction.png')
-    fig.savefig(path, dpi=150, bbox_inches='tight')
-    print(f"  Saved: {path}")
-    plt.close(fig)
-
+    print(f"[Success] Generated benchmark charts in {output_dir}")
 
 def main():
-    parser = argparse.ArgumentParser(
-        description='Generate evaluation figures promised in project proposal (§4.1).')
-    parser.add_argument('--input', default='data/sweeps/results.csv',
-                        help='Path to sweep CSV (default: data/sweeps/results.csv)')
-    parser.add_argument('--output-dir', default='data/sweeps/',
-                        help='Directory for output PNGs (default: data/sweeps/)')
+    parser = argparse.ArgumentParser(description="Plot cold chain experiment results.")
+    parser.add_argument("--input", required=True, help="Input CSV path")
+    parser.add_argument("--output-dir", default="data/sweeps", help="Output directory")
     args = parser.parse_args()
 
-    os.makedirs(args.output_dir, exist_ok=True)
-    df = load_data(args.input)
+    plot_sweeps(Path(args.input), Path(args.output_dir))
 
-    plot_rerr(df, args.output_dir)
-    plot_fliab(df, args.output_dir)
-    plot_storage(df, args.output_dir)
-
-    print("All evaluation plots generated.")
-
-
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

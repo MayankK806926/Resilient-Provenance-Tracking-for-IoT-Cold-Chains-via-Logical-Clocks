@@ -1,64 +1,97 @@
 /// @file iot_device.cpp
-/// @brief IoTDevice implementation — telemetry generation with blackout buffering.
+/// @brief IoT sensor logger implementation with offline buffering and signatures.
 
 #include "coldchain/iot_device.hpp"
 
 namespace coldchain {
 
-IoTDevice::IoTDevice(uint8_t entity_id, size_t n_nodes, uint32_t shipment_id)
-    : entity_id_(entity_id)
-    , shipment_id_(shipment_id)
-    , local_vc_(n_nodes) {}
+IoTDevice::IoTDevice(uint32_t shipment_id, uint8_t initial_custodian, size_t n_nodes)
+    : shipment_id_(shipment_id),
+      current_custodian_(initial_custodian),
+      n_nodes_(n_nodes),
+      local_vc_(n_nodes),
+      lamport_clock_(0) {}
 
-void IoTDevice::set_online(bool online) { is_online_ = online; }
-bool IoTDevice::is_online() const       { return is_online_; }
+void IoTDevice::set_online(bool online) {
+    is_online_ = online;
+}
+
+bool IoTDevice::is_online() const {
+    return is_online_;
+}
+
+void IoTDevice::set_current_custodian(uint8_t custodian_id) {
+    current_custodian_ = custodian_id;
+}
+
+uint8_t IoTDevice::current_custodian() const {
+    return current_custodian_;
+}
 
 SensorEvent IoTDevice::generate_telemetry(float temperature, float lat, float lon,
-                                          uint64_t sim_time_ns,
+                                          uint64_t true_sim_time_ns,
                                           const DriftingPhysicalClock* phys_clock) {
-    // 1. Tick local vector clock (causal ordering)
-    local_vc_.tick(entity_id_);
+    // Advance logical clock along the dimension of the current custodian
+    local_vc_.tick(current_custodian_);
+    uint64_t l_ts = lamport_clock_.tick();
     ++monotonic_counter_;
 
-    // 2. Build event
-    SensorEvent se;
-    se.shipment_id            = shipment_id_;
-    se.origin_entity_id       = entity_id_;
-    se.temperature_celsius    = temperature;
-    se.latitude               = lat;
-    se.longitude              = lon;
-    se.local_monotonic_counter = monotonic_counter_;
-    se.vc                     = local_vc_;  // snapshot
+    uint64_t phys_ns = phys_clock ? phys_clock->now_ns(true_sim_time_ns, temperature)
+                                  : true_sim_time_ns;
 
-    // Physical timestamp for naive baseline comparison
-    if (phys_clock)
-        se.physical_timestamp_ns = phys_clock->now_ns(sim_time_ns);
-    else
-        se.physical_timestamp_ns = sim_time_ns;
+    SensorEvent ev;
+    ev.shipment_id             = shipment_id_;
+    ev.origin_entity_id        = current_custodian_;
+    ev.temperature_celsius     = temperature;
+    ev.latitude                = lat;
+    ev.longitude               = lon;
+    ev.local_monotonic_counter = monotonic_counter_;
+    ev.vc                      = local_vc_;
+    ev.lamport_ts              = l_ts;
+    ev.creation_time_ns        = true_sim_time_ns;
+    ev.physical_timestamp_ns   = phys_ns;
+    ev.receipt_timestamp_ns    = 0;
+    ev.is_pruned               = false;
 
-    // MAC-style signature
-    se.signature = sign_event(se.serialize(), default_node_secret(entity_id_));
+    // Cryptographic signature with origin node's key
+    ev.signature               = sign_event(ev.serialize(), node_private_key(current_custodian_));
+    ev.id                      = ev.compute_hash();
 
-    // 3. If offline, buffer; otherwise caller transmits immediately
-    if (!is_online_)
-        buffer_.push_back(se);
+    if (!is_online_) {
+        buffer_.push_back(ev);
+    }
 
-    return se;
+    return ev;
 }
 
 std::vector<SensorEvent> IoTDevice::flush_on_reconnect() {
-    std::vector<SensorEvent> flushed;
-    flushed.swap(buffer_);
+    std::vector<SensorEvent> flushed = std::move(buffer_);
+    buffer_.clear();
     return flushed;
 }
 
-size_t IoTDevice::buffered_count() const { return buffer_.size(); }
+size_t IoTDevice::buffered_count() const {
+    return buffer_.size();
+}
 
-const VectorClock& IoTDevice::local_clock() const    { return local_vc_; }
-VectorClock&       IoTDevice::local_clock_mut()      { return local_vc_; }
+const VectorClock& IoTDevice::local_clock() const {
+    return local_vc_;
+}
 
-uint8_t  IoTDevice::entity_id()   const { return entity_id_; }
-uint32_t IoTDevice::shipment_id() const { return shipment_id_; }
-void     IoTDevice::set_shipment_id(uint32_t id) { shipment_id_ = id; }
+VectorClock& IoTDevice::local_clock_mut() {
+    return local_vc_;
+}
+
+uint64_t IoTDevice::current_lamport_ts() const {
+    return lamport_clock_.value();
+}
+
+void IoTDevice::merge_lamport_ts(uint64_t incoming_ts) {
+    lamport_clock_.update_and_tick(incoming_ts);
+}
+
+uint32_t IoTDevice::shipment_id() const {
+    return shipment_id_;
+}
 
 } // namespace coldchain

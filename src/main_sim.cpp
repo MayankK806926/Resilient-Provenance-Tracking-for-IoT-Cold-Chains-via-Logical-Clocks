@@ -1,32 +1,23 @@
 /// @file main_sim.cpp
-/// @brief CLI simulation runner — full pipeline with pruning, metrics,
-///        and dual-pipeline comparison (vector clock vs naive baseline).
+/// @brief CLI simulation runner — multi-pipeline comparison (Vector Clock vs Fair Physical vs Naive vs Lamport),
+///        Merkle multi-block chain verification, and matrix-clock pruning.
 
 #include <iostream>
 #include <iomanip>
 #include <string>
 #include <vector>
-#include <algorithm>
 
-#include "coldchain/causal_merge_engine.hpp"
 #include "coldchain/config.hpp"
-#include "coldchain/events.hpp"
-#include "coldchain/hashing.hpp"
-#include "coldchain/ledger_block.hpp"
-#include "coldchain/matrix_clock.hpp"
 #include "coldchain/metrics.hpp"
 #include "coldchain/network_simulator.hpp"
-#include "coldchain/physical_clock.hpp"
-#include "coldchain/pruning_engine.hpp"
-#include "coldchain/vector_clock.hpp"
 
 using namespace coldchain;
 
 void print_banner() {
-    std::cout << "--------------------\n"
+    std::cout << "================================================================================\n"
               << " Resilient Provenance Tracking for IoT Cold Chains via Logical Clocks\n"
-              << " CS6666 Distributed Ledger Technologies — Simulation Harness\n"
-              << "--------------------\n\n";
+              << " Multi-Pipeline Discrete-Event Simulation & Replicated Ledger Verification\n"
+              << "================================================================================\n\n";
 }
 
 int main(int argc, char* argv[]) {
@@ -47,6 +38,8 @@ int main(int argc, char* argv[]) {
             cfg.gossip_rounds = static_cast<size_t>(std::stoul(argv[++i]));
         } else if (arg == "--seed" && i + 1 < argc) {
             cfg.seed = std::stoull(argv[++i]);
+        } else if (arg == "--ultra-cold") {
+            cfg.apply_profile(ColdChainProfile::UltraCold_minus70C);
         } else if (arg == "--verbose" || arg == "-v") {
             verbose = true;
         } else if (arg == "--help" || arg == "-h") {
@@ -57,6 +50,7 @@ int main(int argc, char* argv[]) {
                       << "  --blackout-mean-hours H    Mean blackout duration (default: 4)\n"
                       << "  --sampling-interval-s S    Telemetry interval in seconds (default: 60)\n"
                       << "  --gossip-rounds N          Matrix clock gossip rounds (default: 3)\n"
+                      << "  --ultra-cold               Use -70°C mRNA vaccine profile\n"
                       << "  --seed S                   Random seed (default: 42)\n"
                       << "  --verbose, -v              Print detailed logs\n"
                       << "  --help, -h                 Show this message\n";
@@ -65,211 +59,100 @@ int main(int argc, char* argv[]) {
     }
 
     print_banner();
-    std::cout << "[Config]\n"
+    std::cout << "[Configuration]\n"
               << "  Shipments:          " << cfg.num_shipments << "\n"
               << "  Duration:           " << cfg.duration_hours << " hours\n"
-              << "  Sampling interval:  " << cfg.sampling_interval_s << " seconds\n"
-              << "  Gossip rounds:      " << cfg.gossip_rounds << "\n"
-              << "  Blackout mean:      " << cfg.blackout_mean_hours << " hours\n"
-              << "  Blackout rate:      " << cfg.blackout_rate_per_hour << " /hour/node\n"
-              << "  Clock drift:        ±" << cfg.drift_ppm_mean << " PPM\n"
-              << "  TX jitter mean:     " << cfg.tx_jitter_mean_ms << " ms\n"
-              << "  Seed:               " << cfg.seed << "\n"
-              << "  Entities:           " << cfg.num_nodes
-              << " (Manufacturer, Distributor, Cold Storage, Pharmacy)\n\n";
+              << "  Sampling interval:  " << cfg.sampling_interval_s << " s\n"
+              << "  Profile:            " << (cfg.profile == ColdChainProfile::StandardPharma_2_8C ? "2-8°C Standard Pharma" : "-70°C Ultra-Cold mRNA") << "\n"
+              << "  Safe Temp Limits:   [" << cfg.temp_low_c << "°C, " << cfg.temp_high_c << "°C]\n"
+              << "  Clock Drift Range:  [" << cfg.drift_ppm_min << ", " << cfg.drift_ppm_max << "] PPM\n"
+              << "  Replication Nodes:  " << cfg.num_nodes << "\n"
+              << "  Block Capacity:     " << cfg.events_per_block << " events/block\n"
+              << "  Gossip Rounds:      " << cfg.gossip_rounds << "\n"
+              << "  Random Seed:        " << cfg.seed << "\n\n";
 
-    // Run simulation
-    std::cout << "[Simulation] Running discrete-event network simulation...\n";
+    std::cout << "[Simulation] Running discrete-event cold-chain execution...\n";
     NetworkSimulator sim(cfg);
     sim.run_full();
 
-    std::cout << "  Generated:   " << sim.total_events_generated() << " events\n"
-              << "  Blackouts:   " << sim.total_blackouts_injected() << " injected\n"
-              << "  Sim clock:   " << std::fixed << std::setprecision(1)
-              << sim.sim_clock_ms() / (3600.0 * 1000.0) << " hours\n\n";
+    std::cout << "  Events generated:   " << sim.total_events_generated() << "\n"
+              << "  Blackouts injected: " << sim.total_blackouts_injected() << "\n"
+              << "  Partitions tested:  " << sim.total_partitions_injected() << "\n\n";
 
-    // Pipeline 1: Vector Clock
-    std::cout << "--- Pipeline 1: Vector Clock + Causal Merge Engine ---\n";
+    std::cout << "[Evaluation] Computing metrics across baselines and replicas...\n";
+    RunMetrics m = evaluate_simulation(sim, cfg);
 
-    std::vector<LedgerEvent> vclock_all_events;
-    size_t vclock_total_blocks = 0;
-    for (size_t i = 0; i < sim.num_nodes(); ++i) {
-        const auto& events = sim.vclock_node(i).all_events();
-        vclock_all_events.insert(vclock_all_events.end(), events.begin(), events.end());
-        vclock_total_blocks += sim.vclock_node(i).chain().size();
-    }
+    std::cout << "\n--------------------------------------------------------------------------------\n"
+              << " EVALUATION RESULTS: 4-PIPELINE COMPARATIVE BENCHMARK\n"
+              << "--------------------------------------------------------------------------------\n";
 
-    // Topo-sort all collected events
-    auto vclock_sorted = CausalMergeEngine::topo_sort(vclock_all_events);
-    size_t vclock_inversions = 0;
-    double vc_rerr = compute_causal_misordering_rate(vclock_sorted, vclock_inversions);
-    bool vclock_causal_ok = (vclock_inversions == 0);
+    std::cout << std::left
+              << std::setw(28) << "Metric"
+              << " | " << std::setw(11) << "VectorClock"
+              << " | " << std::setw(12) << "FairPhysical"
+              << " | " << std::setw(12) << "NaiveReceipt"
+              << " | " << std::setw(11) << "Lamport" << "\n";
+    std::cout << "-----------------------------+-------------+--------------+--------------+-------------\n";
 
-    std::cout << "  Events received: " << vclock_all_events.size() << "\n"
-              << "  Blocks sealed:   " << vclock_total_blocks << "\n"
-              << "  Causal inversions (R_err): " << vclock_inversions << " (must be 0)\n"
-              << "  Causal invariant:          " << (vclock_causal_ok ? "PASS" : "FAIL") << "\n";
+    auto print_row_d = [](const std::string& name, double vc, double fp, double nr, double lp, int prec = 4) {
+        std::cout << std::left << std::setw(28) << name << " | "
+                  << std::right << std::fixed << std::setprecision(prec)
+                  << std::setw(11) << vc << " | "
+                  << std::setw(12) << fp << " | "
+                  << std::setw(12) << nr << " | "
+                  << std::setw(11) << lp << "\n";
+    };
 
-    // Verify all chains
-    bool vclock_chains_valid = true;
+    auto print_row_u = [](const std::string& name, size_t vc, size_t fp, size_t nr, size_t lp) {
+        std::cout << std::left << std::setw(28) << name << " | "
+                  << std::right
+                  << std::setw(11) << vc << " | "
+                  << std::setw(12) << fp << " | "
+                  << std::setw(12) << nr << " | "
+                  << std::setw(11) << lp << "\n";
+    };
+
+    print_row_u("Causal Inversions (Count)",
+                m.vclock.inversions, m.fair_physical.inversions, m.naive_receipt.inversions, m.lamport.inversions);
+    print_row_d("R_err (Causal Denom)",
+                m.vclock.r_err_causal, m.fair_physical.r_err_causal, m.naive_receipt.r_err_causal, m.lamport.r_err_causal, 6);
+    print_row_d("R_err (Total Denom)",
+                m.vclock.r_err_total, m.fair_physical.r_err_total, m.naive_receipt.r_err_total, m.lamport.r_err_total, 6);
+    print_row_d("False Liability (F_liab)",
+                m.vclock.f_liab, m.fair_physical.f_liab, m.naive_receipt.f_liab, m.lamport.f_liab, 4);
+    print_row_d("Concurrent Misordering C_err",
+                m.vclock.c_err_concurrency, m.fair_physical.c_err_concurrency, m.naive_receipt.c_err_concurrency, m.lamport.c_err_concurrency, 4);
+
+    std::cout << "-----------------------------+-------------+--------------+--------------+-------------\n";
+
+    std::cout << "\n[Replicated Ledger Verification]\n"
+              << "  Replica State Convergence:  " << (m.all_replicas_converged ? "CONVERGED (Identical canonical state hash)" : "FAILED (Divergent)") << "\n";
+
+    bool all_chains_valid = true;
     for (size_t i = 0; i < sim.num_nodes(); ++i) {
         if (!verify_chain(sim.vclock_node(i).chain())) {
-            vclock_chains_valid = false;
+            all_chains_valid = false;
             break;
         }
     }
-    std::cout << "  Chain integrity:           " << (vclock_chains_valid ? "VALID" : "CORRUPT") << "\n";
+    std::cout << "  Multi-block Chain Integrity: " << (all_chains_valid ? "VALID (All block hashes & Merkle roots verified)" : "CORRUPT") << "\n"
+              << "  Total Blocks Sealed:         " << m.total_blocks << "\n";
 
-    // Matrix-clock pruning
-    std::cout << "\n--- Matrix-Clock Pruning ---\n";
+    std::cout << "\n[Matrix-Clock Pruning & Garbage Collection]\n"
+              << "  Store Size (Unpruned):       " << m.unpruned_store_size << " records\n"
+              << "  Store Size (Pruned):         " << m.pruned_store_size << " records\n"
+              << "  Storage Reduction (S_prune): " << std::fixed << std::setprecision(2) << (m.storage_reduction_ratio * 100.0) << "%\n"
+              << "  Oracle Safety Violations:    " << m.safety_violations << " (must be 0)\n"
+              << "  Gossip Network Overhead:     " << m.gossip_messages << " messages (" << m.gossip_bytes << " bytes)\n";
 
-    if (cfg.gossip_rounds > 0) {
-        std::cout << "  Propagating matrix clocks via " << cfg.gossip_rounds
-                  << " gossip round(s)...\n";
-        sim.gossip_rounds(cfg.gossip_rounds);
-    } else {
-        std::cout << "  (0 gossip rounds configured — matrix clocks will not advance)\n";
-    }
-
-    size_t store_before = 0;
-    for (size_t i = 0; i < sim.num_nodes(); ++i)
-        store_before += sim.vclock_node(i).active_state_store().size();
-
-    size_t total_pruned = 0;
-    for (size_t i = 0; i < sim.num_nodes(); ++i) {
-        size_t pruned = PruningEngine::prune_stable_records(sim.vclock_node(i));
-        total_pruned += pruned;
-        if (verbose) {
-            VectorClock horizon = PruningEngine::pruning_horizon(sim.vclock_node(i));
-            std::cout << "  Node " << i << ": pruned " << pruned
-                      << " records, horizon = " << horizon.to_string() << "\n";
-        }
-    }
-
-    size_t store_after = 0;
-    for (size_t i = 0; i < sim.num_nodes(); ++i)
-        store_after += sim.vclock_node(i).active_state_store().size();
-
-    double s_prune = compute_storage_reduction(store_after, store_before);
-    std::cout << "  Store before pruning: " << store_before << " records\n"
-              << "  Store after pruning:  " << store_after << " records\n"
-              << "  Records pruned:       " << total_pruned << "\n"
-              << "  S_prune:              " << std::fixed << std::setprecision(2)
-              << (s_prune * 100.0) << "%\n";
-
-    // Verify chain integrity after pruning (pruning must NOT corrupt chain)
-    bool post_prune_valid = true;
-    for (size_t i = 0; i < sim.num_nodes(); ++i) {
-        if (!verify_chain(sim.vclock_node(i).chain())) {
-            post_prune_valid = false;
-            break;
-        }
-    }
-    std::cout << "  Chain integrity post-prune: "
-              << (post_prune_valid ? "VALID" : "CORRUPT") << "\n";
-
-    // Matrix clock diagnostics
     if (verbose) {
-        std::cout << "\n  Matrix clock states:\n";
+        std::cout << "\n[Per-Node Matrix Horizons]\n";
         for (size_t i = 0; i < sim.num_nodes(); ++i) {
-            const auto& mc = sim.vclock_node(i).matrix_clock();
-            std::cout << "    Node " << i << ":\n";
-            for (size_t j = 0; j < mc.n(); ++j) {
-                std::cout << "      [";
-                for (size_t k = 0; k < mc.n(); ++k) {
-                    if (k) std::cout << ", ";
-                    std::cout << mc.at(j, k);
-                }
-                std::cout << "]\n";
-            }
-            VectorClock cmin = mc.column_min();
-            std::cout << "      column_min = " << cmin.to_string() << "\n";
+            std::cout << "  Node " << i << " Pruning Horizon: "
+                      << sim.vclock_node(i).matrix_clock().column_min().to_string() << "\n";
         }
     }
-    std::cout << "\n";
 
-    // Pipeline 2: Naive physical baseline
-    std::cout << "--- Pipeline 2: Naive Physical Timestamp Baseline ---\n";
-
-    std::vector<LedgerEvent> naive_all_events;
-    size_t naive_total_blocks = 0;
-    for (size_t i = 0; i < sim.num_nodes(); ++i) {
-        const auto& events = sim.naive_node(i).all_events();
-        naive_all_events.insert(naive_all_events.end(), events.begin(), events.end());
-        naive_total_blocks += sim.naive_node(i).chain().size();
-    }
-
-    auto naive_sorted = naive_physical_order(naive_all_events);
-    size_t naive_inversions = 0;
-    double naive_rerr = compute_causal_misordering_rate(naive_sorted, naive_inversions);
-    bool naive_causal_ok = (naive_inversions == 0);
-
-    std::cout << "  Events received: " << naive_all_events.size() << "\n"
-              << "  Blocks sealed:   " << naive_total_blocks << "\n"
-              << "  Causal inversions (R_err): " << naive_inversions << " (violations due to drift!)\n"
-              << "  Causal invariant:          " << (naive_causal_ok ? "PASS" : "VIOLATION DETECTED") << "\n";
-
-    bool naive_chains_valid = true;
-    for (size_t i = 0; i < sim.num_nodes(); ++i) {
-        if (!verify_chain(sim.naive_node(i).chain())) {
-            naive_chains_valid = false;
-            break;
-        }
-    }
-    std::cout << "  Chain integrity:           " << (naive_chains_valid ? "VALID" : "CORRUPT") << "\n\n";
-
-    // Metrics
-    std::cout << "--- Computed Metrics ---\n";
-
-    auto excursions = extract_excursions(sim.ground_truth_events(), cfg);
-    double vc_fliab    = compute_false_liability_rate(excursions, vclock_sorted, cfg);
-    double naive_fliab = compute_false_liability_rate(excursions, naive_sorted, cfg);
-
-    std::cout << "  R_err (Causal Pipeline): " << std::setprecision(6) << vc_rerr
-              << " (" << vclock_inversions << " inversions)\n"
-              << "  R_err (Naive Baseline):  " << naive_rerr
-              << " (" << naive_inversions << " inversions)\n"
-              << "  F_liab (Causal Pipeline):" << std::setprecision(6) << vc_fliab
-              << " (0 false attributions)\n"
-              << "  F_liab (Naive Baseline): " << naive_fliab
-              << " (" << static_cast<size_t>(std::round(naive_fliab * excursions.size()))
-              << " of " << excursions.size() << " excursions misattributed)\n"
-              << "  S_prune (State Reclaim): " << std::setprecision(4) << s_prune << "\n\n";
-
-    // Summary comparison
-    std::cout << "--------------------\n"
-              << " EVALUATION RESULTS (PROPOSAL METRICS)\n"
-              << "--------------------\n"
-              << " Metric                       | Causal-Order Pipeline | Naive Physical Baseline\n"
-              << "------------------------------+-----------------------+-------------------------\n"
-              << " Causal Inversions (R_err)    | " << std::setw(21) << vclock_inversions << " | "
-              << std::setw(23) << naive_inversions << "\n"
-              << " Causal Misordering Rate R_err| " << std::setw(21) << std::setprecision(6) << vc_rerr << " | "
-              << std::setw(23) << naive_rerr << "\n"
-              << " Zero-Violation Guarantee?    | " << std::setw(21) << (vclock_causal_ok ? "YES (Guaranteed)" : "NO") << " | "
-              << std::setw(23) << (naive_causal_ok ? "YES" : "NO (Violated)") << "\n"
-              << " False Liability Rate (F_liab)| " << std::setw(21) << std::setprecision(6) << vc_fliab << " | "
-              << std::setw(23) << std::setprecision(6) << naive_fliab << "\n"
-              << " State Consolidation (S_prune)| " << std::setw(20) << std::setprecision(2) << (s_prune * 100) << "% | "
-              << std::setw(23) << "0.00% (No GC)" << "\n"
-              << " Active Store (before -> after)| " << std::setw(10) << store_before
-              << " -> " << std::setw(6) << store_after << " | "
-              << std::setw(10) << store_before << " -> " << std::setw(7) << store_before << "\n"
-              << " Cryptographic Chain Valid?   | " << std::setw(21) << (vclock_chains_valid ? "YES (Verified)" : "CORRUPT") << " | "
-              << std::setw(23) << (naive_chains_valid ? "YES" : "NO") << "\n"
-              << " Total Events Generated       | " << std::setw(21) << vclock_all_events.size() << " | "
-              << std::setw(23) << naive_all_events.size() << "\n"
-              << " Blocks Sealed                | " << std::setw(21) << vclock_total_blocks << " | "
-              << std::setw(23) << naive_total_blocks << "\n"
-              << "--------------------\n";
-
-    if (vclock_inversions == 0 && vclock_causal_ok) {
-        std::cout << "\n[PROPOSAL VALIDATION]\n"
-                  << "  1. Causal Ordering:  R_err = 0.000000 guaranteed under arbitrary blackouts and drift.\n"
-                  << "  2. Liability Truth:  F_liab = 0.000000 eliminates false regulatory penalties.\n"
-                  << "  3. Log Pruning:      S_prune = " << std::setprecision(1) << (s_prune * 100.0)
-                  << "% autonomous garbage collection without consensus rounds.\n";
-    }
-
+    std::cout << "\n================================================================================\n";
     return 0;
 }

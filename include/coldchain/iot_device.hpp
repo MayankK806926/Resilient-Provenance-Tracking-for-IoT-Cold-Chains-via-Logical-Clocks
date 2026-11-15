@@ -1,6 +1,6 @@
 #pragma once
 /// @file iot_device.hpp
-/// @brief Edge IoT sensor device with offline buffering.
+/// @brief Edge IoT cold-chain sensor logger with offline buffering and causal tracking.
 
 #include <cstdint>
 #include <vector>
@@ -14,13 +14,17 @@ namespace coldchain {
 
 class IoTDevice {
 public:
-    IoTDevice(uint8_t entity_id, size_t n_nodes, uint32_t shipment_id);
+    IoTDevice(uint32_t shipment_id, uint8_t initial_custodian, size_t n_nodes);
 
     void set_online(bool online);
     bool is_online() const;
 
+    void set_current_custodian(uint8_t custodian_id);
+    uint8_t current_custodian() const;
+
+    // Generate reading with true time, drifted physical RTC time, and Lamport ts
     SensorEvent generate_telemetry(float temperature, float lat, float lon,
-                                   uint64_t sim_time_ns = 0,
+                                   uint64_t true_sim_time_ns,
                                    const DriftingPhysicalClock* phys_clock = nullptr);
 
     std::vector<SensorEvent> flush_on_reconnect();
@@ -29,17 +33,20 @@ public:
     const VectorClock& local_clock() const;
     VectorClock& local_clock_mut();
 
-    uint8_t  entity_id()   const;
+    uint64_t current_lamport_ts() const;
+    void merge_lamport_ts(uint64_t incoming_ts);
+
     uint32_t shipment_id() const;
-    void     set_shipment_id(uint32_t id);
 
 private:
-    uint8_t  entity_id_;
-    uint32_t shipment_id_;
-    VectorClock local_vc_;
+    uint32_t     shipment_id_;
+    uint8_t      current_custodian_;
+    size_t       n_nodes_;
+    VectorClock  local_vc_;
+    LamportClock lamport_clock_;
     std::vector<SensorEvent> buffer_;
-    bool is_online_ = true;
-    uint64_t monotonic_counter_ = 0;
+    bool         is_online_ = true;
+    uint64_t     monotonic_counter_ = 0;
 };
 
 } // namespace coldchain

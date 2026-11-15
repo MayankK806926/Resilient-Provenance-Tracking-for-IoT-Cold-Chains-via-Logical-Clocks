@@ -1,8 +1,5 @@
 /// @file network_simulator.cpp
-/// @brief Discrete-event network simulator implementation.
-///
-/// Generates telemetry, handles custody transfers, injects blackouts,
-/// applies transmission jitter, and feeds events to both pipelines.
+/// @brief Discrete-event cold-chain network simulator implementation.
 
 #include "coldchain/network_simulator.hpp"
 #include "coldchain/causal_merge_engine.hpp"
@@ -13,99 +10,217 @@
 
 namespace coldchain {
 
-//  Construction
-
 NetworkSimulator::NetworkSimulator(const SimConfig& cfg)
     : cfg_(cfg), rng_(cfg.seed) {
-    // Create one device, physical clock, and ledger node per entity.
-    // Devices start with shipment_id=0 (placeholder) — actual shipments
-    // are set up via add_shipment().
     for (size_t i = 0; i < cfg_.num_nodes; ++i) {
-        devices_.emplace_back(static_cast<uint8_t>(i), cfg_.num_nodes, /*shipment*/ 0);
-
-        // Alternate positive/negative drift to stress the naive baseline
-        double mean_ppm = (i % 2 == 0) ? cfg_.drift_ppm_mean : -cfg_.drift_ppm_mean;
-        phys_clocks_.emplace_back(mean_ppm, cfg_.drift_ppm_stddev, cfg_.seed + i * 100);
-
-        vclock_nodes_.emplace_back(static_cast<uint8_t>(i), cfg_.num_nodes);
-        naive_nodes_.emplace_back(static_cast<uint8_t>(i), cfg_.num_nodes);
+        vclock_nodes_.emplace_back(static_cast<uint8_t>(i), cfg_.num_nodes, cfg_.events_per_block);
     }
 }
 
-//  Shipment management
-
-void NetworkSimulator::add_shipment(uint32_t shipment_id, std::vector<uint8_t> route) {
+void NetworkSimulator::add_shipment(uint32_t shipment_id, std::vector<uint8_t> route, double start_offset_hours) {
     assert(!route.empty());
-
     Shipment ship;
     ship.shipment_id    = shipment_id;
     ship.route          = std::move(route);
-    ship.current_leg    = 0;
-    ship.next_sample_ms = sim_clock_ms_;  // start sampling immediately
+    ship.current_leg_idx = 0;
+    ship.start_time_ms  = start_offset_hours * 3600.0 * 1000.0;
+    ship.next_sample_ms = ship.start_time_ms;
+    ship.finished       = false;
 
-    // Duration per leg: evenly split total sim time across legs
-    double total_ms = cfg_.duration_hours * 3600.0 * 1000.0;
-    double per_leg  = total_ms / static_cast<double>(ship.route.size());
-    ship.leg_end_ms = sim_clock_ms_ + per_leg;
+    // Allocate legs
+    double total_sim_ms = cfg_.duration_hours * 3600.0 * 1000.0;
+    double remaining_ms = total_sim_ms - ship.start_time_ms;
+    if (remaining_ms <= 0.0) remaining_ms = 1000.0;
+
+    size_t num_legs = ship.route.size();
+    double base_leg_ms = remaining_ms / static_cast<double>(num_legs);
+
+    double current_start = ship.start_time_ms;
+    for (size_t leg_i = 0; leg_i < num_legs; ++leg_i) {
+        double leg_duration = base_leg_ms;
+        if (cfg_.randomize_leg_lengths && num_legs > 1 && leg_i + 1 < num_legs) {
+            std::uniform_real_distribution<double> perturb(0.7, 1.3);
+            leg_duration *= perturb(rng_);
+        }
+        double leg_end = (leg_i + 1 == num_legs) ? total_sim_ms : (current_start + leg_duration);
+        ship.legs.push_back({ship.route[leg_i], current_start, leg_end});
+
+        CustodyInterval ci;
+        ci.shipment_id   = shipment_id;
+        ci.custodian_id  = ship.route[leg_i];
+        ci.start_ms      = current_start;
+        ci.end_ms        = leg_end;
+        custody_intervals_.push_back(ci);
+
+        current_start = leg_end;
+    }
 
     shipments_.push_back(ship);
+
+    // Create a dedicated IoT logger device for this shipment
+    shipment_loggers_.emplace_back(shipment_id, ship.route.front(), cfg_.num_nodes);
+
+    // Sample distinct physical clock drift (between drift_ppm_min and drift_ppm_max)
+    std::uniform_real_distribution<double> drift_dist(cfg_.drift_ppm_min, cfg_.drift_ppm_max);
+    double drift = drift_dist(rng_);
+    if (shipment_id % 2 == 1) drift = -drift; // Alternate positive / negative drift
+
+    std::uniform_real_distribution<double> offset_dist(-cfg_.initial_offset_max_s * 1e9,
+                                                        cfg_.initial_offset_max_s * 1e9);
+    int64_t initial_offset_ns = static_cast<int64_t>(offset_dist(rng_));
+
+    shipment_clocks_.emplace_back(drift, initial_offset_ns, cfg_.temp_dependent_drift, cfg_.seed + shipment_id * 100);
 }
 
-//  Blackout injection
+void NetworkSimulator::setup_shipments() {
+    if (!shipments_.empty()) return;
+
+    std::vector<uint8_t> default_route;
+    for (uint8_t i = 0; i < static_cast<uint8_t>(cfg_.num_nodes); ++i) {
+        default_route.push_back(i);
+    }
+
+    std::uniform_real_distribution<double> stagger_dist(0.0, cfg_.stagger_start_max_hours);
+    for (uint32_t s = 1; s <= cfg_.num_shipments; ++s) {
+        double stagger_hours = (cfg_.stagger_start_max_hours > 0.0) ? stagger_dist(rng_) : 0.0;
+        add_shipment(s, default_route, stagger_hours);
+    }
+}
 
 void NetworkSimulator::inject_blackout(uint8_t node_id, double duration_ms) {
-    BlackoutEvent be;
-    be.start_ms = sim_clock_ms_;
-    be.end_ms   = sim_clock_ms_ + duration_ms;
-    be.node_id  = node_id;
-    blackouts_.push_back(be);
+    BlackoutPeriod bp;
+    bp.start_ms  = sim_clock_ms_;
+    bp.end_ms    = sim_clock_ms_ + duration_ms;
+    bp.entity_id = node_id;
+    blackouts_.push_back(bp);
     ++total_blackouts_;
 }
 
-void NetworkSimulator::generate_random_blackouts() {
-    if (cfg_.blackout_rate_per_hour <= 0.0 || cfg_.duration_hours <= 0.0) {
-        return;
-    }
+void NetworkSimulator::inject_partition(uint8_t node_a, uint8_t node_b, double duration_ms) {
+    NetworkPartition np;
+    np.start_ms = sim_clock_ms_;
+    np.end_ms   = sim_clock_ms_ + duration_ms;
+    np.node_a   = node_a;
+    np.node_b   = node_b;
+    partitions_.push_back(np);
+    ++total_partitions_;
+}
 
-    // Model blackout arrivals as Poisson process per node
+void NetworkSimulator::generate_failure_events() {
     double total_ms = cfg_.duration_hours * 3600.0 * 1000.0;
-    double rate_per_ms = cfg_.blackout_rate_per_hour / (3600.0 * 1000.0);
 
-    std::exponential_distribution<double> inter_arrival(rate_per_ms);
-    bool use_dist = (cfg_.blackout_mean_hours > 0.0 && cfg_.blackout_stddev_hours > 0.0);
-    std::lognormal_distribution<double>   duration_dist(
-        use_dist ? std::log(cfg_.blackout_mean_hours * 3600.0 * 1000.0) : 0.0,
-        use_dist ? (cfg_.blackout_stddev_hours / cfg_.blackout_mean_hours) : 1.0
-    );
+    // 1. Device-to-gateway blackouts (Poisson process per custodian)
+    if (cfg_.blackout_rate_per_hour > 0.0) {
+        double rate_per_ms = cfg_.blackout_rate_per_hour / (3600.0 * 1000.0);
+        std::exponential_distribution<double> inter_arrival(rate_per_ms);
 
-    for (size_t node = 0; node < cfg_.num_nodes; ++node) {
-        double t = inter_arrival(rng_);
-        while (t < total_ms) {
-            double dur = use_dist ? std::abs(duration_dist(rng_))
-                                  : (cfg_.blackout_mean_hours * 3600.0 * 1000.0);
-            // Clamp duration to reasonable range
-            dur = std::min(dur, 48.0 * 3600.0 * 1000.0);
-            dur = std::max(dur, 1000.0);  // at least 1 second
+        for (size_t node = 0; node < cfg_.num_nodes; ++node) {
+            double t = inter_arrival(rng_);
+            while (t < total_ms) {
+                double dur_ms = cfg_.blackout_mean_hours * 3600.0 * 1000.0;
+                if (cfg_.blackout_stddev_hours > 0.0 && cfg_.blackout_mean_hours > 0.0) {
+                    std::lognormal_distribution<double> dist(
+                        std::log(dur_ms),
+                        cfg_.blackout_stddev_hours / cfg_.blackout_mean_hours);
+                    dur_ms = std::max(5000.0, std::abs(dist(rng_)));
+                }
 
-            BlackoutEvent be;
-            be.start_ms = t;
-            be.end_ms   = t + dur;
-            be.node_id  = static_cast<uint8_t>(node);
-            blackouts_.push_back(be);
-            ++total_blackouts_;
+                BlackoutPeriod bp;
+                bp.start_ms  = t;
+                bp.end_ms    = t + dur_ms;
+                bp.entity_id = static_cast<uint8_t>(node);
+                blackouts_.push_back(bp);
+                ++total_blackouts_;
 
-            t += dur + inter_arrival(rng_);  // next blackout after this one ends
+                t += dur_ms + inter_arrival(rng_);
+            }
         }
     }
 
-    // Sort by start time for efficient processing
-    std::sort(blackouts_.begin(), blackouts_.end(),
-              [](const BlackoutEvent& a, const BlackoutEvent& b) {
-                  return a.start_ms < b.start_ms;
-              });
+    // 2. Node-to-node network partitions
+    if (cfg_.partition_rate_per_hour > 0.0 && cfg_.num_nodes > 1) {
+        double rate_per_ms = cfg_.partition_rate_per_hour / (3600.0 * 1000.0);
+        std::exponential_distribution<double> inter_arrival(rate_per_ms);
+
+        for (size_t a = 0; a < cfg_.num_nodes; ++a) {
+            for (size_t b = a + 1; b < cfg_.num_nodes; ++b) {
+                double t = inter_arrival(rng_);
+                while (t < total_ms) {
+                    double dur_ms = cfg_.partition_mean_hours * 3600.0 * 1000.0;
+                    NetworkPartition np;
+                    np.start_ms = t;
+                    np.end_ms   = t + dur_ms;
+                    np.node_a   = static_cast<uint8_t>(a);
+                    np.node_b   = static_cast<uint8_t>(b);
+                    partitions_.push_back(np);
+                    ++total_partitions_;
+                    t += dur_ms + inter_arrival(rng_);
+                }
+            }
+        }
+    }
+
+    // 3. Contiguous temperature excursion episodes
+    if (cfg_.excursion_rate_per_hour > 0.0) {
+        double rate_per_ms = cfg_.excursion_rate_per_hour / (3600.0 * 1000.0);
+        std::exponential_distribution<double> inter_arrival(rate_per_ms);
+
+        for (size_t s_idx = 0; s_idx < shipments_.size(); ++s_idx) {
+            double t = inter_arrival(rng_);
+            while (t < total_ms) {
+                double dur_ms = cfg_.excursion_duration_mean_min * 60.0 * 1000.0;
+                std::uniform_real_distribution<float> peak_dist(
+                    cfg_.temp_high_c + 3.0f, cfg_.temp_high_c + 12.0f);
+
+                ExcursionEpisode ep;
+                ep.shipment_id = shipments_[s_idx].shipment_id;
+                ep.start_ms    = t;
+                ep.end_ms      = t + dur_ms;
+                ep.peak_temp_c = peak_dist(rng_);
+                excursion_episodes_.push_back(ep);
+
+                t += dur_ms + inter_arrival(rng_);
+            }
+        }
+    }
 }
 
-//  Jitter / distribution sampling
+bool NetworkSimulator::is_node_in_blackout(uint8_t node_id, double time_ms) const {
+    for (const auto& bo : blackouts_) {
+        if (bo.entity_id == node_id && time_ms >= bo.start_ms && time_ms < bo.end_ms)
+            return true;
+    }
+    return false;
+}
+
+bool NetworkSimulator::is_partitioned(uint8_t node_a, uint8_t node_b, double time_ms) const {
+    for (const auto& np : partitions_) {
+        if (((np.node_a == node_a && np.node_b == node_b) ||
+             (np.node_a == node_b && np.node_b == node_a)) &&
+            time_ms >= np.start_ms && time_ms < np.end_ms) {
+            return true;
+        }
+    }
+    return false;
+}
+
+float NetworkSimulator::sample_ambient_temperature(uint32_t shipment_id, double time_ms) {
+    // Check if an excursion episode is active for this shipment
+    for (const auto& ep : excursion_episodes_) {
+        if (ep.shipment_id == shipment_id && time_ms >= ep.start_ms && time_ms < ep.end_ms) {
+            // Smooth bell curve temperature excursion
+            double progress = (time_ms - ep.start_ms) / (ep.end_ms - ep.start_ms);
+            float delta = (ep.peak_temp_c - cfg_.temp_high_c) * static_cast<float>(std::sin(progress * 3.14159265));
+            return cfg_.temp_high_c + delta;
+        }
+    }
+
+    // Normal safe ambient range with Gaussian perturbation
+    float nominal_mid = (cfg_.temp_low_c + cfg_.temp_high_c) * 0.5f;
+    std::normal_distribution<float> norm_dist(nominal_mid, (cfg_.temp_high_c - cfg_.temp_low_c) * 0.15f);
+    float t = norm_dist(rng_);
+    return std::clamp(t, cfg_.temp_low_c + 0.1f, cfg_.temp_high_c - 0.1f);
+}
 
 double NetworkSimulator::sample_tx_jitter() {
     if (cfg_.tx_jitter_mean_ms <= 0.0) return 0.0;
@@ -117,217 +232,216 @@ double NetworkSimulator::sample_tx_jitter() {
     return std::abs(dist(rng_));
 }
 
-double NetworkSimulator::sample_blackout_duration() {
-    double mean_ms = cfg_.blackout_mean_hours * 3600.0 * 1000.0;
-    if (mean_ms <= 0.0) return 1000.0;
-    if (cfg_.blackout_stddev_hours <= 0.0) return std::max(1000.0, mean_ms);
-    std::lognormal_distribution<double> dist(
-        std::log(mean_ms),
-        cfg_.blackout_stddev_hours / cfg_.blackout_mean_hours
-    );
-    return std::max(1000.0, std::abs(dist(rng_)));
-}
+void NetworkSimulator::broadcast_event(const LedgerEvent& ev, uint8_t origin_node) {
+    // Broadcast event to ALL nodes over simulated network links
+    for (size_t target = 0; target < cfg_.num_nodes; ++target) {
+        if (cfg_.link_loss_probability > 0.0 && target != origin_node) {
+            std::uniform_real_distribution<double> loss_dist(0.0, 1.0);
+            if (loss_dist(rng_) < cfg_.link_loss_probability) {
+                continue; // Packet dropped by lossy link
+            }
+        }
 
-//  Core simulation helpers
-
-namespace {
-
-/// Check whether a given node is in a blackout at a given time.
-bool is_in_blackout(const std::vector<BlackoutEvent>& blackouts,
-                    uint8_t node_id, double time_ms) {
-    for (const auto& bo : blackouts) {
-        if (bo.node_id == node_id && time_ms >= bo.start_ms && time_ms < bo.end_ms)
-            return true;
+        double jitter = (target == origin_node) ? 0.0 : sample_tx_jitter();
+        ScheduledMessage msg;
+        msg.fire_time_ms = sim_clock_ms_ + jitter;
+        msg.from_node    = origin_node;
+        msg.to_node      = static_cast<uint8_t>(target);
+        msg.payload      = ev;
+        msg.is_gossip    = false;
+        message_queue_.push(msg);
     }
-    return false;
 }
-
-} // namespace
 
 void NetworkSimulator::process_telemetry(Shipment& ship) {
-    if (ship.finished || ship.current_leg >= ship.route.size()) return;
+    if (ship.finished || ship.current_leg_idx >= ship.legs.size()) return;
 
-    uint8_t entity = ship.route[ship.current_leg];
-    auto& device = devices_[entity];
-    device.set_shipment_id(ship.shipment_id);
+    size_t s_idx = ship.shipment_id - 1;
+    auto& device = shipment_loggers_[s_idx];
+    auto& clock  = shipment_clocks_[s_idx];
 
-    // Check blackout status
-    bool blacked_out = is_in_blackout(blackouts_, entity, sim_clock_ms_);
+    const auto& leg = ship.legs[ship.current_leg_idx];
+    uint8_t current_custodian = leg.custodian;
+    device.set_current_custodian(current_custodian);
+
+    bool blacked_out = is_node_in_blackout(current_custodian, sim_clock_ms_);
     device.set_online(!blacked_out);
 
-    // Convert sim clock to nanoseconds for physical timestamping
     uint64_t sim_time_ns = static_cast<uint64_t>(sim_clock_ms_ * 1e6);
+    float temp = sample_ambient_temperature(ship.shipment_id, sim_clock_ms_);
+    float lat = 12.97f + 0.1f * current_custodian;
+    float lon = 77.59f + 0.1f * current_custodian;
 
-    // Generate telemetry
-    // Temperature: 2-8°C normal range with occasional excursion
-    std::uniform_real_distribution<float> temp_dist(2.5f, 7.5f);
-    float temperature = temp_dist(rng_);
+    SensorEvent se = device.generate_telemetry(temp, lat, lon, sim_time_ns, &clock);
 
-    // Inject occasional temperature excursion (5% chance)
-    std::uniform_real_distribution<float> excursion_chance(0.0f, 1.0f);
-    if (excursion_chance(rng_) < 0.05f) {
-        temperature = 10.0f + static_cast<float>(std::uniform_real_distribution<double>(0, 5)(rng_));
-    }
-
-    float lat = 12.97f + 0.1f * entity;
-    float lon = 77.59f + 0.1f * entity;
-
-    SensorEvent se = device.generate_telemetry(
-        temperature, lat, lon, sim_time_ns, &phys_clocks_[entity]);
-
-    // Record in ground truth (true generation order)
+    // Record ground truth event and register causal dependency
+    size_t new_idx = ground_truth_.size();
     ground_truth_.push_back(se);
+    event_index_map_[se.id] = new_idx;
+
+    // Expand ground truth causality matrix: all previously generated events for this shipment precede this event
+    gt_causality_matrix_.resize(new_idx + 1);
+    for (auto& row : gt_causality_matrix_) {
+        row.resize(new_idx + 1, false);
+    }
+    for (size_t prev_i = 0; prev_i < new_idx; ++prev_i) {
+        if (event_shipment_id(ground_truth_[prev_i]) == ship.shipment_id) {
+            gt_causality_matrix_[prev_i][new_idx] = true;
+        }
+    }
 
     if (device.is_online()) {
-        // Schedule delivery to the current entity's ledger node with jitter
-        double jitter = sample_tx_jitter();
-
-        ScheduledMessage vclock_msg;
-        vclock_msg.fire_time_ms = sim_clock_ms_ + jitter;
-        vclock_msg.from = entity;
-        vclock_msg.to   = entity;
-        vclock_msg.payload = se;
-        vclock_queue_.push(vclock_msg);
-
-        // Same event to naive pipeline (same jitter for fairness)
-        ScheduledMessage naive_msg = vclock_msg;
-        naive_queue_.push(naive_msg);
+        broadcast_event(se, current_custodian);
     }
-    // If offline, event stays in device buffer — will be flushed on reconnect.
 }
 
 void NetworkSimulator::process_custody_transfer(Shipment& ship) {
     if (ship.finished) return;
-    if (ship.current_leg + 1 >= ship.route.size()) {
+    if (ship.current_leg_idx + 1 >= ship.legs.size()) {
         ship.finished = true;
         return;
     }
 
-    uint8_t from_entity = ship.route[ship.current_leg];
-    uint8_t to_entity   = ship.route[ship.current_leg + 1];
+    size_t s_idx = ship.shipment_id - 1;
+    auto& device = shipment_loggers_[s_idx];
+    auto& clock  = shipment_clocks_[s_idx];
 
-    // Flush any buffered events from the departing device.
-    // Models δ_sync (reconnection latency): upon reconnect the device NTP-syncs
-    // its clock to the current wall time, so buffered readings acquire physical
-    // timestamps clustered around the reconnection instant rather than their
-    // original generation time. This is the root cause of false liability
-    // attribution in naive timestamp-based pipelines.
-    auto& from_device = devices_[from_entity];
-    if (!from_device.is_online()) {
-        from_device.set_online(true);
+    uint8_t from_entity = ship.legs[ship.current_leg_idx].custodian;
+    uint8_t to_entity   = ship.legs[ship.current_leg_idx + 1].custodian;
+
+    // Reconnection flush: flush any offline buffered readings
+    if (!device.is_online()) {
+        device.set_online(true);
+        if (cfg_.resync_at_reconnect) {
+            uint64_t reconnect_ns = static_cast<uint64_t>(sim_clock_ms_ * 1e6);
+            clock.resync(reconnect_ns);
+        }
     }
-    auto buffered = from_device.flush_on_reconnect();
-    uint64_t reconnect_ns = static_cast<uint64_t>(sim_clock_ms_ * 1e6);
+
+    auto buffered = device.flush_on_reconnect();
+    double base_jitter = sample_tx_jitter();
     for (size_t bi = 0; bi < buffered.size(); ++bi) {
         auto& se = buffered[bi];
-        // Re-stamp with from_entity's drifted clock at reconnect time + upload queue offset
-        uint64_t upload_offset_ns = static_cast<uint64_t>(bi) * 1'000'000ULL; // 1ms per queued event
-        se.physical_timestamp_ns = phys_clocks_[from_entity].now_ns(reconnect_ns) + upload_offset_ns;
+        // Re-stamp with upload offset if resyncing
+        uint64_t upload_offset_ns = static_cast<uint64_t>(bi) * 1'000'000ULL;
+        uint64_t reconnect_ns = static_cast<uint64_t>(sim_clock_ms_ * 1e6);
+        se.physical_timestamp_ns = clock.now_ns(reconnect_ns, se.temperature_celsius) + upload_offset_ns;
 
-        double jitter = sample_tx_jitter();
-        ScheduledMessage msg;
-        msg.fire_time_ms = sim_clock_ms_ + jitter;
-        msg.from = from_entity;
-        msg.to   = from_entity;
-        msg.payload = se;
-        vclock_queue_.push(msg);
-
-        ScheduledMessage naive_msg = msg;
-        naive_queue_.push(naive_msg);
+        for (size_t target = 0; target < cfg_.num_nodes; ++target) {
+            ScheduledMessage msg;
+            msg.fire_time_ms = sim_clock_ms_ + base_jitter + static_cast<double>(bi) * 0.1;
+            msg.from_node    = from_entity;
+            msg.to_node      = static_cast<uint8_t>(target);
+            msg.payload      = se;
+            msg.is_gossip    = false;
+            message_queue_.push(msg);
+        }
     }
 
-    // Create custody transfer event
-    auto& from_vc = devices_[from_entity].local_clock_mut();
+    // Generate custody transfer event
+    auto& from_vc = device.local_clock_mut();
     from_vc.tick(from_entity);
 
-    uint64_t sim_time_ns = static_cast<uint64_t>(sim_clock_ms_ * 1e6);
-
     CustodyEvent ce;
-    ce.shipment_id         = ship.shipment_id;
-    ce.from_entity_id      = from_entity;
-    ce.to_entity_id        = to_entity;
+    ce.shipment_id          = ship.shipment_id;
+    ce.from_entity_id       = from_entity;
+    ce.to_entity_id         = to_entity;
     ce.custody_transfer_seq = ++custody_seq_;
-    ce.vc                  = from_vc;
-    ce.physical_timestamp_ns = phys_clocks_[to_entity].now_ns(sim_time_ns);
-    ce.transfer_signature  = sign_event(ce.serialize(), default_node_secret(from_entity));
+    ce.vc                   = from_vc;
+    ce.lamport_ts           = device.current_lamport_ts() + 1;
+    ce.creation_time_ns     = static_cast<uint64_t>(sim_clock_ms_ * 1e6);
+    ce.physical_timestamp_ns = clock.now_ns(ce.creation_time_ns, 4.0f);
+    ce.receipt_timestamp_ns = 0;
+    ce.is_pruned            = false;
+    ce.transfer_signature   = sign_event(ce.serialize(), node_private_key(from_entity));
+    ce.id                   = ce.compute_hash();
 
+    size_t new_idx = ground_truth_.size();
     ground_truth_.push_back(ce);
+    event_index_map_[ce.id] = new_idx;
 
-    // Deliver to both pipelines
-    double jitter = sample_tx_jitter();
-    ScheduledMessage msg;
-    msg.fire_time_ms = sim_clock_ms_ + jitter;
-    msg.from = from_entity;
-    msg.to   = to_entity;
-    msg.payload = ce;
-    vclock_queue_.push(msg);
+    // Ground-truth happens-before: custody event happens after all prior events of this shipment
+    gt_causality_matrix_.resize(new_idx + 1);
+    for (auto& row : gt_causality_matrix_) {
+        row.resize(new_idx + 1, false);
+    }
+    for (size_t prev_i = 0; prev_i < new_idx; ++prev_i) {
+        if (event_shipment_id(ground_truth_[prev_i]) == ship.shipment_id) {
+            gt_causality_matrix_[prev_i][new_idx] = true;
+        }
+    }
 
-    ScheduledMessage naive_msg = msg;
-    naive_queue_.push(naive_msg);
+    // Broadcast custody event after flushed readings
+    for (size_t target = 0; target < cfg_.num_nodes; ++target) {
+        ScheduledMessage msg;
+        msg.fire_time_ms = sim_clock_ms_ + base_jitter + static_cast<double>(buffered.size() + 1) * 0.1;
+        msg.from_node    = from_entity;
+        msg.to_node      = static_cast<uint8_t>(target);
+        msg.payload      = ce;
+        msg.is_gossip    = false;
+        message_queue_.push(msg);
+    }
 
-    // Merge VC into the receiving device (causal link across entities)
-    devices_[to_entity].local_clock_mut().merge(from_vc);
+    // Handoff protocol: recipient incorporates custody clock (if enabled)
+    if (cfg_.handoff_merge_enabled) {
+        from_vc.tick(to_entity);
+    }
 
     // Advance to next leg
-    ship.current_leg++;
-    double total_ms = cfg_.duration_hours * 3600.0 * 1000.0;
-    double per_leg  = total_ms / static_cast<double>(ship.route.size());
-    ship.leg_end_ms = sim_clock_ms_ + per_leg;
+    ship.current_leg_idx++;
+    device.set_current_custodian(to_entity);
 }
 
 void NetworkSimulator::deliver_pending_messages() {
-    // Deliver all messages whose fire_time <= sim_clock
-    while (!vclock_queue_.empty() && vclock_queue_.top().fire_time_ms <= sim_clock_ms_) {
-        auto msg = vclock_queue_.top();
-        vclock_queue_.pop();
+    while (!message_queue_.empty() && message_queue_.top().fire_time_ms <= sim_clock_ms_) {
+        auto msg = message_queue_.top();
+        message_queue_.pop();
 
-        vclock_received_.push_back(msg.payload);
+        // Check if link is partitioned at delivery time
+        if (msg.from_node != msg.to_node && is_partitioned(msg.from_node, msg.to_node, sim_clock_ms_)) {
+            // Reschedule delivery after partition heals
+            msg.fire_time_ms = sim_clock_ms_ + 5000.0;
+            message_queue_.push(msg);
+            continue;
+        }
 
-        // Feed into vclock pipeline: topo-sort single-event "batch"
-        std::vector<LedgerEvent> batch = {msg.payload};
-        auto sorted = CausalMergeEngine::topo_sort(batch);
-        vclock_nodes_[msg.to].ingest_batch(sorted);
-    }
+        // Set gateway receipt timestamp
+        uint64_t receipt_ns = static_cast<uint64_t>(sim_clock_ms_ * 1e6);
+        set_event_receipt_time(msg.payload, receipt_ns);
 
-    while (!naive_queue_.empty() && naive_queue_.top().fire_time_ms <= sim_clock_ms_) {
-        auto msg = naive_queue_.top();
-        naive_queue_.pop();
-
-        naive_received_.push_back(msg.payload);
-
-        // Naive pipeline: no causal sorting, just ingest as-is
-        std::vector<LedgerEvent> batch = {msg.payload};
-        naive_nodes_[msg.to].ingest_batch(batch);
+        // Ingest into target node's replicated ledger
+        vclock_nodes_[msg.to_node].ingest_event(
+            msg.payload,
+            cfg_.verify_signatures_enabled,
+            cfg_.hold_back_enabled
+        );
     }
 }
 
-//  Simulation control
-
 void NetworkSimulator::step(double delta_time_ms) {
     double target = sim_clock_ms_ + delta_time_ms;
-    double step_resolution = cfg_.sampling_interval_s * 1000.0;  // one tick per sampling interval
+    double step_resolution = cfg_.sampling_interval_s * 1000.0;
 
     while (sim_clock_ms_ < target) {
         sim_clock_ms_ = std::min(sim_clock_ms_ + step_resolution, target);
 
-        // Process telemetry for each active shipment
         for (auto& ship : shipments_) {
-            if (ship.finished) continue;
+            if (ship.finished || sim_clock_ms_ < ship.start_time_ms) continue;
 
-            // Time for a custody transfer?
-            if (sim_clock_ms_ >= ship.leg_end_ms) {
-                process_custody_transfer(ship);
-                continue;
+            if (ship.current_leg_idx < ship.legs.size()) {
+                const auto& leg = ship.legs[ship.current_leg_idx];
+                if (sim_clock_ms_ >= leg.end_ms) {
+                    process_custody_transfer(ship);
+                    continue;
+                }
             }
 
-            // Time for a telemetry reading?
             if (sim_clock_ms_ >= ship.next_sample_ms) {
                 process_telemetry(ship);
                 ship.next_sample_ms = sim_clock_ms_ + cfg_.sampling_interval_s * 1000.0;
             }
         }
 
-        // Deliver messages that have arrived
         deliver_pending_messages();
     }
 }
@@ -338,100 +452,105 @@ void NetworkSimulator::run_until(double end_time_ms) {
 }
 
 void NetworkSimulator::run_full() {
-    // Generate random blackouts before running
-    generate_random_blackouts();
-
-    // Add default shipments if none were added
-    if (shipments_.empty()) {
-        std::vector<uint8_t> default_route;
-        for (uint8_t i = 0; i < static_cast<uint8_t>(cfg_.num_nodes); ++i)
-            default_route.push_back(i);
-
-        for (uint32_t s = 1; s <= cfg_.num_shipments; ++s)
-            add_shipment(s, default_route);
-    }
+    setup_shipments();
+    generate_failure_events();
 
     double total_ms = cfg_.duration_hours * 3600.0 * 1000.0;
     run_until(total_ms);
 
-    // Flush any remaining buffered events from all devices (δ_sync model)
-    uint64_t flush_ns = static_cast<uint64_t>(sim_clock_ms_ * 1e6);
-    for (size_t i = 0; i < devices_.size(); ++i) {
-        auto& device = devices_[i];
+    // Final flush on sim termination
+    for (size_t s_idx = 0; s_idx < shipments_.size(); ++s_idx) {
+        auto& device = shipment_loggers_[s_idx];
+        auto& clock  = shipment_clocks_[s_idx];
+        uint8_t cust = device.current_custodian();
         device.set_online(true);
+        if (cfg_.resync_at_reconnect) {
+            clock.resync(static_cast<uint64_t>(sim_clock_ms_ * 1e6));
+        }
         auto buffered = device.flush_on_reconnect();
+        double base_jitter = sample_tx_jitter();
         for (size_t bi = 0; bi < buffered.size(); ++bi) {
             auto& se = buffered[bi];
-            uint64_t upload_offset_ns = static_cast<uint64_t>(bi) * 1'000'000ULL;
-            se.physical_timestamp_ns = phys_clocks_[i].now_ns(flush_ns) + upload_offset_ns;
-
-            ScheduledMessage msg;
-            msg.fire_time_ms = sim_clock_ms_;
-            msg.from = static_cast<uint8_t>(i);
-            msg.to   = static_cast<uint8_t>(i);
-            msg.payload = se;
-            vclock_queue_.push(msg);
-
-            ScheduledMessage naive_msg = msg;
-            naive_queue_.push(naive_msg);
+            for (size_t target = 0; target < cfg_.num_nodes; ++target) {
+                ScheduledMessage msg;
+                msg.fire_time_ms = sim_clock_ms_ + base_jitter + static_cast<double>(bi) * 0.1;
+                msg.from_node    = cust;
+                msg.to_node      = static_cast<uint8_t>(target);
+                msg.payload      = se;
+                msg.is_gossip    = false;
+                message_queue_.push(msg);
+            }
         }
     }
-    deliver_pending_messages();
 
-    // Auto-seal remaining pending events on all nodes
-    for (auto& node : vclock_nodes_) {
-        if (node.pending_count() > 0)
-            node.seal_block();
+    // Heal all network partitions and drain all remaining in-flight messages
+    partitions_.clear();
+    while (!message_queue_.empty()) {
+        sim_clock_ms_ = std::max(sim_clock_ms_, message_queue_.top().fire_time_ms);
+        deliver_pending_messages();
     }
-    for (auto& node : naive_nodes_) {
-        if (node.pending_count() > 0)
+
+    // Auto-seal final blocks
+    for (auto& node : vclock_nodes_) {
+        if (node.pending_count() > 0) {
             node.seal_block();
+        }
     }
 }
 
 void NetworkSimulator::gossip_rounds(size_t rounds) {
     size_t n = vclock_nodes_.size();
+
     for (size_t r = 0; r < rounds; ++r) {
+        // Synchronous gossip: snapshot current matrix clocks first
+        std::vector<MatrixClock> snapshots;
+        snapshots.reserve(n);
+        for (size_t i = 0; i < n; ++i) {
+            snapshots.push_back(vclock_nodes_[i].matrix_clock());
+        }
+
         for (size_t i = 0; i < n; ++i) {
             for (size_t j = 0; j < n; ++j) {
                 if (i == j) continue;
-                // Node j receives node i's matrix clock
-                vclock_nodes_[j].matrix_clock().merge_matrix(
-                    vclock_nodes_[i].node_id(), vclock_nodes_[i].matrix_clock());
-
-                // Node j updates its own row with knowledge received from node i
-                for (size_t k = 0; k < n; ++k) {
-                    uint32_t cur = vclock_nodes_[j].matrix_clock().at(j, k);
-                    uint32_t learned = vclock_nodes_[i].matrix_clock().at(i, k);
-                    if (learned > cur) {
-                        vclock_nodes_[j].matrix_clock().set(j, k, learned);
-                    }
+                if (is_partitioned(static_cast<uint8_t>(i), static_cast<uint8_t>(j), sim_clock_ms_)) {
+                    continue; // Gossip link blocked by partition
                 }
+
+                // Node j receives node i's snapshot
+                vclock_nodes_[j].matrix_clock().merge_matrix(j, i, snapshots[i]);
+                ++gossip_messages_sent_;
+                gossip_bytes_sent_ += sizeof(uint32_t) * n * n;
             }
         }
     }
 }
 
-//  Accessors
+bool NetworkSimulator::is_ground_truth_preceding(size_t event_idx_a, size_t event_idx_b) const {
+    if (event_idx_a >= gt_causality_matrix_.size() ||
+        event_idx_b >= gt_causality_matrix_.size()) {
+        return false;
+    }
+    return gt_causality_matrix_[event_idx_a][event_idx_b];
+}
 
 LedgerNode& NetworkSimulator::vclock_node(size_t idx)             { return vclock_nodes_[idx]; }
 const LedgerNode& NetworkSimulator::vclock_node(size_t idx) const { return vclock_nodes_[idx]; }
-LedgerNode& NetworkSimulator::naive_node(size_t idx)              { return naive_nodes_[idx]; }
-const LedgerNode& NetworkSimulator::naive_node(size_t idx) const  { return naive_nodes_[idx]; }
+const std::vector<LedgerNode>& NetworkSimulator::all_vclock_nodes() const { return vclock_nodes_; }
 size_t NetworkSimulator::num_nodes() const                        { return cfg_.num_nodes; }
 double NetworkSimulator::sim_clock_ms() const                     { return sim_clock_ms_; }
 
 const std::vector<LedgerEvent>& NetworkSimulator::ground_truth_events() const {
     return ground_truth_;
 }
-const std::vector<LedgerEvent>& NetworkSimulator::vclock_received_events() const {
-    return vclock_received_;
-}
-const std::vector<LedgerEvent>& NetworkSimulator::naive_received_events() const {
-    return naive_received_;
+const std::vector<CustodyInterval>& NetworkSimulator::true_custody_intervals() const {
+    return custody_intervals_;
 }
 
-size_t NetworkSimulator::total_events_generated() const  { return ground_truth_.size(); }
-size_t NetworkSimulator::total_blackouts_injected() const { return total_blackouts_; }
+size_t NetworkSimulator::total_events_generated() const    { return ground_truth_.size(); }
+size_t NetworkSimulator::total_blackouts_injected() const  { return total_blackouts_; }
+size_t NetworkSimulator::total_partitions_injected() const { return total_partitions_; }
+size_t NetworkSimulator::gossip_messages_sent() const     { return gossip_messages_sent_; }
+size_t NetworkSimulator::gossip_bytes_sent() const        { return gossip_bytes_sent_; }
+size_t NetworkSimulator::safety_violations_detected() const { return safety_violations_; }
 
 } // namespace coldchain

@@ -4,6 +4,13 @@ project(coldchain_vclock CXX)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# Enable compiler warnings
+if(MSVC)
+    add_compile_options(/W4 /permissive-)
+else()
+    add_compile_options(-Wall -Wextra -pedantic)
+endif()
+
 # --- Core library -----------------------------------------------------------
 add_library(coldchain_core
     src/vector_clock.cpp
@@ -35,32 +42,18 @@ target_include_directories(sweep_runner PRIVATE deps)
 # --- Tests -------------------------------------------------------------------
 enable_testing()
 
-add_executable(test_ledger_integrity tests/test_ledger_integrity.cpp)
-target_link_libraries(test_ledger_integrity coldchain_core)
-target_include_directories(test_ledger_integrity PRIVATE deps)
-add_test(NAME LedgerIntegrity COMMAND test_ledger_integrity)
+macro(add_coldchain_test test_name source_file)
+    add_executable(${test_name} ${source_file})
+    target_link_libraries(${test_name} coldchain_core)
+    target_include_directories(${test_name} PRIVATE deps)
+    add_test(NAME ${test_name} COMMAND ${test_name})
+endmacro()
 
-add_executable(test_vector_clock tests/test_vector_clock.cpp)
-target_link_libraries(test_vector_clock coldchain_core)
-target_include_directories(test_vector_clock PRIVATE deps)
-add_test(NAME VectorClock COMMAND test_vector_clock)
-
-add_executable(test_causal_merge tests/test_causal_merge.cpp)
-target_link_libraries(test_causal_merge coldchain_core)
-target_include_directories(test_causal_merge PRIVATE deps)
-add_test(NAME CausalMerge COMMAND test_causal_merge)
-
-add_executable(test_matrix_clock tests/test_matrix_clock.cpp)
-target_link_libraries(test_matrix_clock coldchain_core)
-target_include_directories(test_matrix_clock PRIVATE deps)
-add_test(NAME MatrixClock COMMAND test_matrix_clock)
-
-add_executable(test_network_simulator tests/test_network_simulator.cpp)
-target_link_libraries(test_network_simulator coldchain_core)
-target_include_directories(test_network_simulator PRIVATE deps)
-add_test(NAME NetworkSimulator COMMAND test_network_simulator)
-
-add_executable(test_pruning_safety tests/test_pruning_safety.cpp)
-target_link_libraries(test_pruning_safety coldchain_core)
-target_include_directories(test_pruning_safety PRIVATE deps)
-add_test(NAME PruningSafety COMMAND test_pruning_safety)
+add_coldchain_test(test_ledger_integrity tests/test_ledger_integrity.cpp)
+add_coldchain_test(test_vector_clock tests/test_vector_clock.cpp)
+add_coldchain_test(test_causal_merge tests/test_causal_merge.cpp)
+add_coldchain_test(test_matrix_clock tests/test_matrix_clock.cpp)
+add_coldchain_test(test_network_simulator tests/test_network_simulator.cpp)
+add_coldchain_test(test_pruning_safety tests/test_pruning_safety.cpp)
+add_coldchain_test(test_replicated_ledger tests/test_replicated_ledger.cpp)
+add_coldchain_test(test_baselines_metrics tests/test_baselines_metrics.cpp)
