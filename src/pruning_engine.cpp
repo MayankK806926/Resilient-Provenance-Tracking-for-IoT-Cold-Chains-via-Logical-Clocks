@@ -30,11 +30,11 @@ size_t PruningEngine::prune_stable_records(LedgerNode& node,
                                            float temp_high_c,
                                            const std::vector<LedgerNode>* all_nodes_oracle,
                                            size_t* out_safety_violations) {
-    VectorClock horizon = node.matrix_clock().column_min();
     auto& store = node.active_state_store_mut();
 
     size_t removed = 0;
     std::vector<Hash256> pruned_hashes;
+    std::map<uint32_t, VectorClock> horizons;
 
     for (auto it = store.begin(); it != store.end(); ) {
         const auto& ev = it->second;
@@ -44,6 +44,14 @@ size_t PruningEngine::prune_stable_records(LedgerNode& node,
             ++it;
             continue;
         }
+
+        uint32_t sid = ev.shipment_id;
+        auto hit = horizons.find(sid);
+        if (hit == horizons.end()) {
+            horizons[sid] = node.shipment_matrix_clock(sid).column_min();
+            hit = horizons.find(sid);
+        }
+        const VectorClock& horizon = hit->second;
 
         if (is_safe_to_prune(ev.vc, horizon)) {
             // Safety invariant check via oracle: verify every node has actually delivered this event
@@ -95,13 +103,21 @@ size_t PruningEngine::prune_stable_records(LedgerNode& node,
 }
 
 size_t PruningEngine::count_prunable(const LedgerNode& node, float temp_low_c, float temp_high_c) {
-    VectorClock horizon = node.matrix_clock().column_min();
     const auto& store = node.active_state_store();
+    std::map<uint32_t, VectorClock> horizons;
 
     size_t count = 0;
     for (const auto& [key, event] : store) {
-        if (!is_excursion(event, temp_low_c, temp_high_c) &&
-            is_safe_to_prune(event.vc, horizon)) {
+        if (is_excursion(event, temp_low_c, temp_high_c)) continue;
+
+        uint32_t sid = event.shipment_id;
+        auto hit = horizons.find(sid);
+        if (hit == horizons.end()) {
+            horizons[sid] = node.shipment_matrix_clock(sid).column_min();
+            hit = horizons.find(sid);
+        }
+
+        if (is_safe_to_prune(event.vc, hit->second)) {
             ++count;
         }
     }
@@ -109,7 +125,7 @@ size_t PruningEngine::count_prunable(const LedgerNode& node, float temp_low_c, f
 }
 
 VectorClock PruningEngine::pruning_horizon(const LedgerNode& node) {
-    return node.matrix_clock().column_min();
+    return node.shipment_matrix_clock(1).column_min();
 }
 
 } // namespace coldchain

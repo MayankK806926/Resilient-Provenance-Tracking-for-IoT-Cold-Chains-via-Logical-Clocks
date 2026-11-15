@@ -185,3 +185,83 @@ TEST_CASE("Causal gating: custody event held back until preceding sensor reading
     CHECK(std::holds_alternative<CustodyEvent>(node.all_events()[2]));
 }
 
+TEST_CASE("Ablation: zeroed vector clocks fail causal readiness and stall in hold-back queue") {
+    LedgerNode node(0, 3);
+
+    VectorClock zero_vc(3); // [0, 0, 0] — ablated logical clock
+    auto ev = make_signed_sensor(0, zero_vc, 1);
+
+    // Ingest event with ablated vector clock
+    node.ingest_event(ev);
+
+    // Must be rejected by causal readiness check and stuck in hold-back queue!
+    CHECK(node.hold_back_count() == 1);
+    CHECK(node.all_events().empty());
+}
+
+TEST_CASE("Cross-entity concurrency diamond: dock inspection and carrier transit merge at custody receive") {
+    LedgerNode node(0, 3);
+
+    // Carrier (origin 0) transit readings
+    VectorClock carrier_vc(3);
+    carrier_vc.tick(0);
+    auto s_carrier = make_signed_sensor(0, carrier_vc, 1);
+
+    // Carrier departure event
+    carrier_vc.tick(0);
+    CustodyEvent ce_depart;
+    ce_depart.shipment_id          = 1;
+    ce_depart.from_entity_id       = 0;
+    ce_depart.to_entity_id         = 1;
+    ce_depart.origin_entity_id     = 0;
+    ce_depart.custody_transfer_seq = 1;
+    ce_depart.vc                   = carrier_vc;
+    ce_depart.transfer_signature   = sign_event(ce_depart.serialize(), node_private_key(0));
+    ce_depart.id                   = ce_depart.compute_hash();
+
+    // Receiver (origin 1) dock inspection reading (concurrent with carrier transit!)
+    VectorClock dock_vc(3);
+    dock_vc.tick(1);
+    auto s_dock = make_signed_sensor(1, dock_vc, 1);
+
+    // Receiver arrival event (merges carrier_vc and dock_vc, then ticks 1)
+    VectorClock recv_vc = carrier_vc;
+    recv_vc.merge(dock_vc);
+    recv_vc.tick(1);
+
+    CustodyEvent ce_recv;
+    ce_recv.shipment_id          = 1;
+    ce_recv.from_entity_id       = 0;
+    ce_recv.to_entity_id         = 1;
+    ce_recv.origin_entity_id     = 1;
+    ce_recv.custody_transfer_seq = 2;
+    ce_recv.vc                   = recv_vc;
+    ce_recv.transfer_signature   = sign_event(ce_recv.serialize(), node_private_key(1));
+    ce_recv.id                   = ce_recv.compute_hash();
+
+    // Ingest ce_recv FIRST: must be held back because predecessors haven't arrived!
+    node.ingest_event(ce_recv);
+    CHECK(node.hold_back_count() == 1);
+    CHECK(node.all_events().empty());
+
+    // Ingest s_dock: delivers s_dock, but ce_recv remains held back because carrier events missing!
+    node.ingest_event(s_dock);
+    CHECK(node.all_events().size() == 1);
+    CHECK(node.hold_back_count() == 1);
+
+    // Ingest s_carrier: delivers s_carrier, but ce_recv still missing ce_depart!
+    node.ingest_event(s_carrier);
+    CHECK(node.all_events().size() == 2);
+    CHECK(node.hold_back_count() == 1);
+
+    // Ingest ce_depart: unblocks ce_recv!
+    node.ingest_event(ce_depart);
+    CHECK(node.hold_back_count() == 0);
+    CHECK(node.all_events().size() == 4);
+
+    // Final delivered event must be ce_recv!
+    CHECK(node.all_events().back().index() == 1); // CustodyEvent
+    CHECK(std::get<CustodyEvent>(node.all_events().back()).origin_entity_id == 1);
+    CHECK(CausalMergeEngine::is_causally_valid(node.all_events()));
+}
+

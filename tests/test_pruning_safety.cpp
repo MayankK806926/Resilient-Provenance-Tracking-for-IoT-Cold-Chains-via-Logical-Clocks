@@ -63,6 +63,7 @@ TEST_CASE("Retention policy: excursions are NEVER pruned") {
     // Normal event (within 2-8°C)
     SensorEvent normal = make_sensor(0, vc, 5.0f);
     // Excursion event (temperature excursion 15°C!)
+    vc.tick(0);
     SensorEvent excursion = make_sensor(0, vc, 15.0f);
 
     node.ingest_event(normal);

@@ -49,9 +49,14 @@ public:
     const VectorClock& local_clock() const;
     MatrixClock&       matrix_clock();
     const MatrixClock& matrix_clock() const;
+    MatrixClock&       shipment_matrix_clock(uint32_t sid);
+    const MatrixClock& shipment_matrix_clock(uint32_t sid) const;
+    const std::map<uint32_t, MatrixClock>& all_shipment_matrix_clocks() const;
+    const VectorClock& shipment_delivered_vc(uint32_t sid) const;
 
     uint8_t node_id() const;
     size_t  events_per_block() const;
+    size_t  total_sensor_events_delivered() const;
 
     // Memory footprint estimates
     size_t active_store_bytes() const;
@@ -76,11 +81,11 @@ private:
 
     std::set<Hash256> delivered_hashes_;
     size_t num_shipments_ = 1;
-    std::map<uint32_t, VectorClock> shipment_vcs_;
-    std::map<uint32_t, uint64_t> shipment_counters_;
-    std::map<uint32_t, uint64_t> custody_sequences_;
+    std::map<uint32_t, MatrixClock> shipment_mcs_;
+    std::map<uint32_t, VectorClock> delivered_vcs_;
     std::map<uint64_t, SensorEvent> active_state_store_;
     uint64_t next_state_key_ = 0;
+    size_t total_sensor_events_delivered_ = 0;
 };
 
 } // namespace coldchain

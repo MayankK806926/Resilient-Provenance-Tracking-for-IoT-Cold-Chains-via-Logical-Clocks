@@ -135,6 +135,8 @@ private:
     std::vector<IoTDevice> shipment_loggers_;
     std::vector<DriftingPhysicalClock> shipment_clocks_;
     std::vector<uint64_t> entity_lamport_clocks_;
+    std::map<uint32_t, std::vector<VectorClock>> entity_shipment_vcs_;
+    std::map<uint32_t, std::vector<uint64_t>> entity_shipment_counters_;
 
     std::vector<LedgerNode> vclock_nodes_;
 

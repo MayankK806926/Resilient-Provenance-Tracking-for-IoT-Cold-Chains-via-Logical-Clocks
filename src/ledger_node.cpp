@@ -18,49 +18,45 @@ LedgerNode::LedgerNode(uint8_t node_id, size_t n_nodes, size_t events_per_block,
       mc_(n_nodes),
       num_shipments_(num_shipments) {
     for (size_t s = 1; s <= num_shipments_; ++s) {
-        shipment_vcs_[static_cast<uint32_t>(s)] = VectorClock(n_nodes_);
+        uint32_t sid = static_cast<uint32_t>(s);
+        shipment_mcs_[sid] = MatrixClock(n_nodes_);
+        delivered_vcs_[sid] = VectorClock(n_nodes_);
     }
 }
 
 bool LedgerNode::is_causally_ready(const LedgerEvent& ev) const {
-    if (const auto* se = std::get_if<SensorEvent>(&ev)) {
-        // Gated on previous custody handoff: reading belongs to leg after handoff se->custody_transfer_seq
-        if (se->custody_transfer_seq > 0) {
-            uint64_t delivered_custody = 0;
-            auto cit = custody_sequences_.find(se->shipment_id);
-            if (cit != custody_sequences_.end()) {
-                delivered_custody = cit->second;
-            }
-            if (delivered_custody < se->custody_transfer_seq) {
-                return false; // Waiting for preceding custody handoff
-            }
-        }
+    const auto& ev_vc = event_vc(ev);
+    if (ev_vc.size() != n_nodes_) {
+        return false;
+    }
 
-        // Gated on monotonic sensor counter for this shipment
-        uint64_t expected_counter = 1;
-        auto it = shipment_counters_.find(se->shipment_id);
-        if (it != shipment_counters_.end()) {
-            expected_counter = it->second + 1;
-        }
-        if (se->local_monotonic_counter > expected_counter) {
-            return false; // Gap in causal sequence for this shipment — hold back
-        }
-    } else if (const auto* ce = std::get_if<CustodyEvent>(&ev)) {
-        // Gated on per-shipment custody sequence (1, 2, 3...)
-        uint64_t expected_seq = 1;
-        auto it = custody_sequences_.find(ce->shipment_id);
-        if (it != custody_sequences_.end()) {
-            expected_seq = it->second + 1;
-        }
-        if (ce->custody_transfer_seq > expected_seq) {
-            return false; // Gap in custody handoffs for this shipment — hold back
-        }
+    uint8_t origin = event_origin(ev);
+    if (origin >= n_nodes_) {
+        return false;
+    }
 
-        // Gated on sender's prior sensor readings: all readings up to last_sensor_seq must be delivered!
-        auto sit = shipment_counters_.find(ce->shipment_id);
-        uint64_t delivered_sensor = (sit != shipment_counters_.end()) ? sit->second : 0;
-        if (delivered_sensor < ce->last_sensor_seq) {
-            return false; // Custody cannot precede sensor readings taken under prior custodian!
+    // Ablation check: reject events with zeroed/uninitialized vector clocks
+    if (ev_vc[origin] == 0) {
+        return false;
+    }
+
+    uint32_t sid = event_shipment_id(ev);
+    VectorClock del_vc(n_nodes_);
+    auto it = delivered_vcs_.find(sid);
+    if (it != delivered_vcs_.end()) {
+        del_vc = it->second;
+    }
+
+    // Fidge-Mattern / Schiper-Eggli-Sandoz causal delivery condition:
+    // 1. Next event from this origin entity in this shipment
+    if (ev_vc[origin] != del_vc[origin] + 1) {
+        return false;
+    }
+
+    // 2. All causal predecessors from other origin entities in this shipment have already been delivered
+    for (size_t k = 0; k < n_nodes_; ++k) {
+        if (k != origin && ev_vc[k] > del_vc[k]) {
+            return false;
         }
     }
 
@@ -78,38 +74,26 @@ void LedgerNode::deliver_event(LedgerEvent ev) {
 
     uint32_t sid = event_shipment_id(ev);
     if (sid > 0) {
-        auto it = shipment_vcs_.find(sid);
-        if (it == shipment_vcs_.end()) {
-            shipment_vcs_[sid] = VectorClock(n_nodes_);
+        auto it = delivered_vcs_.find(sid);
+        if (it == delivered_vcs_.end()) {
+            delivered_vcs_[sid] = VectorClock(n_nodes_);
         }
-        shipment_vcs_[sid].merge(event_vc(ev));
+        delivered_vcs_[sid].merge(event_vc(ev));
+
+        // Advance this node's own row in the per-shipment matrix clock
+        auto mit = shipment_mcs_.find(sid);
+        if (mit == shipment_mcs_.end()) {
+            shipment_mcs_[sid] = MatrixClock(n_nodes_);
+        }
+        shipment_mcs_[sid].set_own_row(delivered_vcs_[sid], node_id_);
     }
 
-    // Conservative stable progress across active shipments
-    VectorClock stable_vc(n_nodes_);
-    for (size_t k = 0; k < n_nodes_; ++k) {
-        uint32_t min_val = UINT32_MAX;
-        if (shipment_vcs_.empty()) {
-            min_val = local_vc_[k];
-        } else {
-            for (const auto& [id, vc] : shipment_vcs_) {
-                min_val = std::min(min_val, vc[k]);
-            }
-        }
-        stable_vc.set(k, (min_val == UINT32_MAX) ? 0 : min_val);
-    }
+    // Maintain global mc_ with latest local_vc_ for node's own row
+    mc_.set_own_row(local_vc_, node_id_);
 
-    // Update own row in matrix clock to reflect local delivery
-    mc_.set_own_row(stable_vc, node_id_);
-
-    // Update causal sequence counters
     if (const auto* se = std::get_if<SensorEvent>(&ev)) {
-        shipment_counters_[se->shipment_id] = std::max(
-            shipment_counters_[se->shipment_id], se->local_monotonic_counter);
         active_state_store_[next_state_key_++] = *se;
-    } else if (const auto* ce = std::get_if<CustodyEvent>(&ev)) {
-        custody_sequences_[ce->shipment_id] = std::max(
-            custody_sequences_[ce->shipment_id], ce->custody_transfer_seq);
+        ++total_sensor_events_delivered_;
     }
 
     all_events_.push_back(ev);
@@ -257,11 +241,42 @@ std::map<uint64_t, SensorEvent>& LedgerNode::active_state_store_mut() {
 }
 
 const VectorClock& LedgerNode::local_clock() const { return local_vc_; }
-MatrixClock&       LedgerNode::matrix_clock()       { return mc_; }
-const MatrixClock& LedgerNode::matrix_clock() const { return mc_; }
+MatrixClock&       LedgerNode::matrix_clock()       { return shipment_matrix_clock(1); }
+const MatrixClock& LedgerNode::matrix_clock() const { return shipment_matrix_clock(1); }
+
+MatrixClock& LedgerNode::shipment_matrix_clock(uint32_t sid) {
+    auto it = shipment_mcs_.find(sid);
+    if (it == shipment_mcs_.end()) {
+        shipment_mcs_[sid] = MatrixClock(n_nodes_);
+    }
+    return shipment_mcs_[sid];
+}
+
+const MatrixClock& LedgerNode::shipment_matrix_clock(uint32_t sid) const {
+    auto it = shipment_mcs_.find(sid);
+    if (it != shipment_mcs_.end()) {
+        return it->second;
+    }
+    static const MatrixClock empty_mc(n_nodes_);
+    return empty_mc;
+}
+
+const std::map<uint32_t, MatrixClock>& LedgerNode::all_shipment_matrix_clocks() const {
+    return shipment_mcs_;
+}
+
+const VectorClock& LedgerNode::shipment_delivered_vc(uint32_t sid) const {
+    auto it = delivered_vcs_.find(sid);
+    if (it != delivered_vcs_.end()) {
+        return it->second;
+    }
+    static const VectorClock empty_vc(n_nodes_);
+    return empty_vc;
+}
 
 uint8_t LedgerNode::node_id() const          { return node_id_; }
 size_t  LedgerNode::events_per_block() const { return events_per_block_; }
+size_t  LedgerNode::total_sensor_events_delivered() const { return total_sensor_events_delivered_; }
 
 size_t LedgerNode::active_store_bytes() const {
     return active_state_store_.size() * sizeof(SensorEvent);

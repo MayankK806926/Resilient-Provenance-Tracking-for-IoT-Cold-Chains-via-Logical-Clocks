@@ -229,7 +229,8 @@ RunMetrics evaluate_simulation(NetworkSimulator& sim, const SimConfig& cfg) {
 
     size_t unpruned_total = 0;
     for (size_t i = 0; i < sim.num_nodes(); ++i) {
-        unpruned_total += sim.vclock_node(i).active_state_store().size();
+        size_t del = sim.vclock_node(i).total_sensor_events_delivered();
+        unpruned_total += (del > 0) ? del : sim.vclock_node(i).active_state_store().size();
     }
     rm.unpruned_store_size = unpruned_total;
 
