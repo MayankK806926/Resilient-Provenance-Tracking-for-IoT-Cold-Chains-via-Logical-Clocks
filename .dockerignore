@@ -1,0 +1,6 @@
+.git
+build/
+data/sweeps/*.png
+data/sweeps/*.csv
+.vscode
+

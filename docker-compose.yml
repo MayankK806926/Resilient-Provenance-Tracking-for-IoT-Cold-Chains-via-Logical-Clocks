@@ -1,0 +1,10 @@
+version: '3.8'
+
+services:
+  coldchain-demo:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: coldchain_node_demo
+    command: ["--shipments", "5", "--duration-hours", "24", "--seed", "42"]
+

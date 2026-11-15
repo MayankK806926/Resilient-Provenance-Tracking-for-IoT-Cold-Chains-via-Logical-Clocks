@@ -1,0 +1,41 @@
+# Build directories and artifacts
+build/
+bin/
+out/
+*.exe
+*.a
+*.o
+*.obj
+*.so
+*.dylib
+*.dll
+CMakeCache.txt
+CMakeFiles/
+Testing/
+*.ninja_deps
+*.ninja_log
+build.ninja
+cmake_install.cmake
+CTestTestfile.cmake
+
+# IDE & Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Data & Sweep outputs
+data/
+*.csv
+*.png
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Operating System files
+.DS_Store
+Thumbs.db
