@@ -26,9 +26,11 @@ CTestTestfile.cmake
 *~
 
 # Data & Sweep outputs
-data/
-*.csv
-*.png
+data/*
+!data/sweeps/
+data/sweeps/*
+!data/sweeps/results.csv
+!data/sweeps/*.png
 
 # Python
 __pycache__/
